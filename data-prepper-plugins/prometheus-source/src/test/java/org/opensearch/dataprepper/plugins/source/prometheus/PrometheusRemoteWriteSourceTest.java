@@ -1,6 +1,11 @@
 /*
  * Copyright OpenSearch Contributors
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ *
  */
 
 package org.opensearch.dataprepper.plugins.source.prometheus;
@@ -23,7 +28,11 @@ import com.linecorp.armeria.server.ServerBuilder;
 import com.arpnetworking.metrics.prometheus.Remote;
 import com.arpnetworking.metrics.prometheus.Types;
 import io.micrometer.core.instrument.Measurement;
+import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Statistic;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.netty.util.AsciiString;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -36,7 +45,6 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.dataprepper.armeria.authentication.ArmeriaHttpAuthenticationProvider;
 import org.opensearch.dataprepper.armeria.authentication.HttpBasicAuthenticationConfig;
 import org.opensearch.dataprepper.metrics.MetricNames;
-import org.opensearch.dataprepper.metrics.MetricsTestUtil;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.configuration.PipelineDescription;
 import org.opensearch.dataprepper.model.configuration.PluginModel;
@@ -50,17 +58,21 @@ import org.opensearch.dataprepper.plugins.buffer.blockingbuffer.BlockingBufferCo
 import org.xerial.snappy.Snappy;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.StringJoiner;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
@@ -116,6 +128,30 @@ class PrometheusRemoteWriteSourceTest {
     private List<Measurement> requestProcessDurationMeasurements;
     private List<Measurement> payloadSizeSummaryMeasurements;
 
+    private static void initMetrics() {
+        final Set<MeterRegistry> registries = new HashSet<>(Metrics.globalRegistry.getRegistries());
+        registries.forEach(Metrics.globalRegistry::remove);
+
+        final List<Meter> meters = new ArrayList<>(Metrics.globalRegistry.getMeters());
+        meters.forEach(Metrics.globalRegistry::remove);
+
+        Metrics.addRegistry(new SimpleMeterRegistry());
+    }
+
+    private static List<Measurement> getMeasurementList(final String meterName) {
+        final MeterRegistry registry = Metrics.globalRegistry.getRegistries().iterator().next();
+        final Meter meter = registry.find(meterName).meter();
+        if (meter == null) {
+            throw new RuntimeException("No metrics meter is available for " + meterName);
+        }
+        return StreamSupport.stream(meter.measure().spliterator(), false)
+                .collect(Collectors.toList());
+    }
+
+    private static Measurement getMeasurementFromList(final List<Measurement> measurements, final Statistic statistic) {
+        return measurements.stream().filter(m -> m.getStatistic() == statistic).findAny().get();
+    }
+
     private BlockingBuffer<Record<Event>> getBuffer(final int bufferSize, final int batchSize) throws JsonProcessingException {
         final HashMap<String, Object> integerHashMap = new HashMap<>();
         integerHashMap.put("buffer_size", bufferSize);
@@ -130,16 +166,16 @@ class PrometheusRemoteWriteSourceTest {
     private void refreshMeasurements() {
         final String metricNamePrefix = new StringJoiner(MetricNames.DELIMITER)
                 .add(TEST_PIPELINE_NAME).add(PLUGIN_NAME).toString();
-        requestsReceivedMeasurements = MetricsTestUtil.getMeasurementList(
+        requestsReceivedMeasurements = getMeasurementList(
                 new StringJoiner(MetricNames.DELIMITER).add(metricNamePrefix)
                         .add(PrometheusRemoteWriteService.REQUESTS_RECEIVED).toString());
-        successRequestsMeasurements = MetricsTestUtil.getMeasurementList(
+        successRequestsMeasurements = getMeasurementList(
                 new StringJoiner(MetricNames.DELIMITER).add(metricNamePrefix)
                         .add(PrometheusRemoteWriteService.SUCCESS_REQUESTS).toString());
-        requestProcessDurationMeasurements = MetricsTestUtil.getMeasurementList(
+        requestProcessDurationMeasurements = getMeasurementList(
                 new StringJoiner(MetricNames.DELIMITER).add(metricNamePrefix)
                         .add(PrometheusRemoteWriteService.REQUEST_PROCESS_DURATION).toString());
-        payloadSizeSummaryMeasurements = MetricsTestUtil.getMeasurementList(
+        payloadSizeSummaryMeasurements = getMeasurementList(
                 new StringJoiner(MetricNames.DELIMITER).add(metricNamePrefix)
                         .add(PrometheusRemoteWriteService.PAYLOAD_SIZE).toString());
     }
@@ -182,7 +218,7 @@ class PrometheusRemoteWriteSourceTest {
         lenient().when(sourceConfig.getAuthentication()).thenReturn(null);
         lenient().when(sourceConfig.isFlattenLabels()).thenReturn(false);
 
-        MetricsTestUtil.initMetrics();
+        initMetrics();
         pluginMetrics = PluginMetrics.fromNames(PLUGIN_NAME, TEST_PIPELINE_NAME);
 
         pluginFactory = mock(PluginFactory.class);
@@ -220,16 +256,16 @@ class PrometheusRemoteWriteSourceTest {
 
         assertEquals(HttpStatus.OK, response.status());
 
-        final Measurement requestReceivedCount = MetricsTestUtil.getMeasurementFromList(
+        final Measurement requestReceivedCount = getMeasurementFromList(
                 requestsReceivedMeasurements, Statistic.COUNT);
         assertEquals(1.0, requestReceivedCount.getValue());
-        final Measurement successRequestsCount = MetricsTestUtil.getMeasurementFromList(
+        final Measurement successRequestsCount = getMeasurementFromList(
                 successRequestsMeasurements, Statistic.COUNT);
         assertEquals(1.0, successRequestsCount.getValue());
-        final Measurement requestProcessDurationCount = MetricsTestUtil.getMeasurementFromList(
+        final Measurement requestProcessDurationCount = getMeasurementFromList(
                 requestProcessDurationMeasurements, Statistic.COUNT);
         assertEquals(1.0, requestProcessDurationCount.getValue());
-        final Measurement payloadSizeMax = MetricsTestUtil.getMeasurementFromList(
+        final Measurement payloadSizeMax = getMeasurementFromList(
                 payloadSizeSummaryMeasurements, Statistic.MAX);
         assertEquals(testPayload.length, payloadSizeMax.getValue());
     }
@@ -273,11 +309,11 @@ class PrometheusRemoteWriteSourceTest {
         sourceUnderTest.start(testBuffer);
         refreshMeasurements();
 
-        final List<Measurement> serverConnectionsMeasurements = MetricsTestUtil.getMeasurementList(
+        final List<Measurement> serverConnectionsMeasurements = getMeasurementList(
                 new StringJoiner(MetricNames.DELIMITER)
                         .add(TEST_PIPELINE_NAME).add(PLUGIN_NAME)
                         .add(PrometheusRemoteWriteSource.SERVER_CONNECTIONS).toString());
-        final Measurement serverConnectionsMeasurement = MetricsTestUtil.getMeasurementFromList(
+        final Measurement serverConnectionsMeasurement = getMeasurementFromList(
                 serverConnectionsMeasurements, Statistic.VALUE);
         assertEquals(0, serverConnectionsMeasurement.getValue());
     }
@@ -460,7 +496,7 @@ class PrometheusRemoteWriteSourceTest {
         when(pluginFactory.loadPlugin(eq(ArmeriaHttpAuthenticationProvider.class), any(PluginSetting.class)))
                 .thenReturn(authProvider);
 
-        MetricsTestUtil.initMetrics();
+        initMetrics();
         pluginMetrics = PluginMetrics.fromNames(PLUGIN_NAME, TEST_PIPELINE_NAME);
         return new PrometheusRemoteWriteSource(sourceConfig, pluginMetrics, pluginFactory, pipelineDescription);
     }
