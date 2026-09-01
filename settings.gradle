@@ -8,6 +8,11 @@
  */
 
 pluginManagement {
+    // Supplies the 'org.opensearch.dataprepper.plugin' Gradle plugin, which bakes OSGi manifests
+    // into Data Prepper plugin JARs at build time. It is the only build plugin this repository adds
+    // for OSGi support; bnd is reached solely through that plugin's own runtime classpath, so no
+    // third-party build plugin is declared here.
+    includeBuild('data-prepper-gradle-plugins/osgi-plugin')
     repositories {
         mavenCentral()
         gradlePluginPortal()
@@ -78,6 +83,12 @@ dependencyResolutionManagement {
             library('avro-core', 'org.apache.avro', 'avro').versionRef('avro')
             library('caffeine', 'com.github.ben-manes.caffeine', 'caffeine').version('3.1.8')
             library('lz4', 'org.lz4', 'lz4-java').version('1.8.0')
+            // Apache Felix is an Apache Software Foundation project (Apache-2.0). 7.0.5 is the latest
+            // published release of the framework and is pinned exactly — never a range — so the
+            // resolved artifact is reproducible. Only plugin-framework-osgi depends on it, and only
+            // when -Ddata-prepper.plugin.framework=osgi actually starts a framework.
+            version('felix', '7.0.5')
+            library('felix-framework', 'org.apache.felix', 'org.apache.felix.framework').versionRef('felix')
         }
         testLibs {
             version('junit', '5.8.2')
@@ -117,6 +128,9 @@ include 'data-prepper-main'
 include 'data-prepper-pipeline-parser'
 include 'data-prepper-plugin-framework'
 include 'data-prepper-plugin-schema-cli'
+include 'plugin-framework-osgi'
+// osgi-plugin is included via pluginManagement { includeBuild } for plugin resolution
+// include 'data-prepper-gradle-plugins:osgi-plugin'
 include 'data-prepper-plugins:common'
 include 'data-prepper-plugins:armeria-common'
 include 'data-prepper-plugins:anomaly-detector-processor'
@@ -222,6 +236,7 @@ include 'data-prepper-plugins:saas-source-plugins:microsoft-office365-source'
 include 'data-prepper-plugins:otlp-sink'
 include 'data-prepper-plugins:otel-apm-service-map-processor'
 include 'data-prepper-plugins:rate-limiter-processor'
+include 'data-prepper-test:osgi-test-plugin'
 
 
 include 'e2e-test:kafka-buffer-backward-compatibility'
