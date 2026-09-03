@@ -10,6 +10,7 @@
 package org.opensearch.dataprepper.plugins.source.splunkhec;
 
 import io.micrometer.core.instrument.Counter;
+import org.opensearch.dataprepper.common.concurrent.BackgroundThreadFactory;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,28 +37,25 @@ public class HecAckManager {
     static final String ACK_EXPIRED_TOTAL = "ackExpiredTotal";
 
     private static final long CLEANUP_INTERVAL_SECONDS = 60;
+    private static final String CLEANUP_THREAD_NAME_PREFIX = "splunk-hec-ack-cleanup";
 
     private static final Logger LOG = LoggerFactory.getLogger(HecAckManager.class);
 
     private final ConcurrentHashMap<String, ChannelState> channelStates;
-    private final Duration ackExpiry;
+    private final Duration acknowledgementExpiry;
     private final ScheduledExecutorService cleanupExecutor;
     private final Counter ackRequestsCounter;
     private final Counter ackConfirmedCounter;
     private final AtomicLong pendingAcks;
     private final Counter ackExpiredCounter;
 
-    public HecAckManager(final Duration ackExpiry, final PluginMetrics pluginMetrics) {
-        Objects.requireNonNull(ackExpiry, "ackExpiry must not be null");
+    public HecAckManager(final Duration acknowledgementExpiry, final PluginMetrics pluginMetrics) {
+        Objects.requireNonNull(acknowledgementExpiry, "acknowledgementExpiry must not be null");
         Objects.requireNonNull(pluginMetrics, "pluginMetrics must not be null");
-        this.ackExpiry = ackExpiry;
+        this.acknowledgementExpiry = acknowledgementExpiry;
         this.channelStates = new ConcurrentHashMap<>();
-        this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-            final Thread thread = new Thread(r);
-            thread.setDaemon(true);
-            thread.setName("splunk-hec-ack-cleanup");
-            return thread;
-        });
+        this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor(
+                BackgroundThreadFactory.defaultExecutorThreadFactory(CLEANUP_THREAD_NAME_PREFIX));
         this.cleanupExecutor.scheduleWithFixedDelay(this::cleanupExpiredAcks,
                 CLEANUP_INTERVAL_SECONDS, CLEANUP_INTERVAL_SECONDS, TimeUnit.SECONDS);
 
@@ -138,16 +136,13 @@ public class HecAckManager {
     void cleanupExpiredAcks() {
         final Instant cutoff;
         try {
-            cutoff = Instant.now().minus(ackExpiry);
+            cutoff = Instant.now().minus(acknowledgementExpiry);
         } catch (final ArithmeticException | DateTimeException e) {
-            LOG.warn("Skipping ack cleanup for ack expiry {}: {}", ackExpiry, e.getMessage());
+            LOG.warn("Skipping ack cleanup for ack expiry {}: {}", acknowledgementExpiry, e.getMessage());
             return;
         }
         for (final String channel : channelStates.keySet()) {
-            channelStates.compute(channel, (k, state) -> {
-                if (state == null) {
-                    return null;
-                }
+            channelStates.computeIfPresent(channel, (k, state) -> {
                 final Iterator<Map.Entry<Long, AckEntry>> it = state.ackEntries.entrySet().iterator();
                 while (it.hasNext()) {
                     final Map.Entry<Long, AckEntry> entry = it.next();
