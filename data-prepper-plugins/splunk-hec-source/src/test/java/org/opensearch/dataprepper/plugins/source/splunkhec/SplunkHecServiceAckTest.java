@@ -19,20 +19,22 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.RequestHeaders;
 import com.linecorp.armeria.common.RequestHeadersBuilder;
-import com.linecorp.armeria.server.ServiceRequestContext;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Timer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.opensearch.dataprepper.event.TestEventFactory;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSet;
 import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.buffer.Buffer;
 import org.opensearch.dataprepper.model.event.Event;
+import org.opensearch.dataprepper.model.event.EventFactory;
 import org.opensearch.dataprepper.model.record.Record;
 import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecTokenConfig;
 
@@ -54,6 +56,8 @@ import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -62,6 +66,8 @@ import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 class SplunkHecServiceAckTest {
+
+    private static final EventFactory TEST_EVENT_FACTORY = TestEventFactory.getTestEventFactory();
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
@@ -76,8 +82,6 @@ class SplunkHecServiceAckTest {
     private SplunkHecSourceConfig config;
     @Mock
     private AcknowledgementSetManager acknowledgementSetManager;
-    @Mock
-    private ServiceRequestContext serviceRequestContext;
     @Mock
     private AcknowledgementSet acknowledgementSet;
 
@@ -119,12 +123,12 @@ class SplunkHecServiceAckTest {
         when(config.getRawLineBreaker()).thenReturn("\n");
         when(config.getDefaultSourcetype()).thenReturn("httpevent");
         lenient().when(config.isWarnFutureTimestamps()).thenReturn(true);
-        when(config.getAckExpiry()).thenReturn(Duration.ofSeconds(300));
+        when(config.getAcknowledgementExpiry()).thenReturn(Duration.ofSeconds(300));
 
         lenient().when(acknowledgementSetManager.create(any(Consumer.class), any(Duration.class)))
                 .thenReturn(acknowledgementSet);
 
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
     }
 
     @Test
@@ -139,7 +143,7 @@ class SplunkHecServiceAckTest {
         final AggregatedHttpRequest request = AggregatedHttpRequest.of(requestHeaders,
                 HttpData.of(StandardCharsets.UTF_8, body));
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(10));
@@ -157,7 +161,7 @@ class SplunkHecServiceAckTest {
         final AggregatedHttpRequest request = AggregatedHttpRequest.of(requestHeaders,
                 HttpData.of(StandardCharsets.UTF_8, body));
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -187,7 +191,7 @@ class SplunkHecServiceAckTest {
         final String body = "{\"event\": \"test message\", \"host\": \"web01\", \"source\": \"app.log\", \"sourcetype\": \"json\", \"index\": \"main\"}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-1");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -199,7 +203,7 @@ class SplunkHecServiceAckTest {
         final String body = "{\"event\": {\"method\": \"GET\", \"path\": \"/api\"}, \"time\": 1713196800}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-2");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -210,7 +214,7 @@ class SplunkHecServiceAckTest {
         final String body = "{\"event\": \"msg\", \"time\": \"1713196800.5\"}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-3");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -222,7 +226,7 @@ class SplunkHecServiceAckTest {
         final String body = "{\"event\": \"msg\", \"time\": " + futureTime + "}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-4");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -233,7 +237,7 @@ class SplunkHecServiceAckTest {
         final String body = "{\"event\": \"msg\", \"fields\": {\"region\": \"us-east\"}}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-5");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -245,7 +249,7 @@ class SplunkHecServiceAckTest {
         final String body = "{\"event\": \"test\"}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-6");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.SERVICE_UNAVAILABLE));
         verify(acknowledgementSet).cancel();
@@ -257,7 +261,7 @@ class SplunkHecServiceAckTest {
         final String body = "{\"event\": \"test\"}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-7");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.INTERNAL_SERVER_ERROR));
         verify(acknowledgementSet).cancel();
@@ -268,7 +272,7 @@ class SplunkHecServiceAckTest {
         final String body = "line1\nline2";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-8");
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 "web-logs", "access", "forwarder", "host1");
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -282,7 +286,7 @@ class SplunkHecServiceAckTest {
         final String body = "line1\nline2";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-9");
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.SERVICE_UNAVAILABLE));
@@ -295,7 +299,7 @@ class SplunkHecServiceAckTest {
         final String body = "line1";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-10");
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.INTERNAL_SERVER_ERROR));
@@ -307,7 +311,7 @@ class SplunkHecServiceAckTest {
         final String body = "line1";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -318,7 +322,7 @@ class SplunkHecServiceAckTest {
     void handleAck_with_valid_channel_and_ackIds() throws Exception {
         final AggregatedHttpRequest createRequest = createRequestWithChannel(
                 "{\"event\": \"test\"}", authHeader, "ch-ack");
-        service.handleEvent(serviceRequestContext, createRequest);
+        service.handleEvent(createRequest);
 
         final String ackBody = "{\"acks\": [0]}";
         final AggregatedHttpRequest request = createAckRequest(ackBody, authHeader, "ch-ack");
@@ -374,7 +378,7 @@ class SplunkHecServiceAckTest {
         final String body = "{\"event\": [1, 2, 3]}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-11");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -385,7 +389,7 @@ class SplunkHecServiceAckTest {
         final String body = "{\"event\": 42}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-12");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -394,12 +398,12 @@ class SplunkHecServiceAckTest {
     @Test
     void handleEvent_flatten_false_keeps_nested_event() throws Exception {
         when(config.isFlattenEvent()).thenReturn(false);
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final String body = "{\"event\": {\"method\": \"GET\"}}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-13");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -410,7 +414,7 @@ class SplunkHecServiceAckTest {
         final String body = "{\"event\": null}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-14");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(12));
@@ -421,7 +425,7 @@ class SplunkHecServiceAckTest {
         final String body = "\n\n\n";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-15");
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -431,13 +435,13 @@ class SplunkHecServiceAckTest {
     @Test
     void handleEvent_without_ack_generic_exception_returns_500() throws Exception {
         when(config.isAcknowledgements()).thenReturn(false);
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         doThrow(new RuntimeException("unexpected")).when(buffer).writeAll(any(Collection.class), anyInt());
         final String body = "{\"event\": \"test\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.INTERNAL_SERVER_ERROR));
     }
@@ -445,13 +449,13 @@ class SplunkHecServiceAckTest {
     @Test
     void handleRaw_without_ack_buffer_full_returns_503() throws Exception {
         when(config.isAcknowledgements()).thenReturn(false);
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         doThrow(new TimeoutException("buffer full")).when(buffer).writeAll(any(Collection.class), anyInt());
         final String body = "line1";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.SERVICE_UNAVAILABLE));
@@ -460,13 +464,13 @@ class SplunkHecServiceAckTest {
     @Test
     void handleRaw_without_ack_generic_exception_returns_500() throws Exception {
         when(config.isAcknowledgements()).thenReturn(false);
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         doThrow(new RuntimeException("unexpected")).when(buffer).writeAll(any(Collection.class), anyInt());
         final String body = "line1";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.INTERNAL_SERVER_ERROR));
@@ -475,12 +479,12 @@ class SplunkHecServiceAckTest {
     @Test
     void handleRaw_without_ack_success() throws Exception {
         when(config.isAcknowledgements()).thenReturn(false);
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final String body = "line1\nline2";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 "idx", "st", "src", "h");
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -495,12 +499,12 @@ class SplunkHecServiceAckTest {
         when(tokenConfigNoDefaults.getDefaults()).thenReturn(null);
         when(config.getTokens()).thenReturn(List.of(tokenConfigNoDefaults));
         when(config.isAcknowledgements()).thenReturn(false);
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final String body = "{\"event\": \"test\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -551,7 +555,7 @@ class SplunkHecServiceAckTest {
         final String body = "{broken json content";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-parse-err");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(6));
@@ -562,7 +566,7 @@ class SplunkHecServiceAckTest {
         final String body = "";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-empty");
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(5));
@@ -578,11 +582,11 @@ class SplunkHecServiceAckTest {
                     return acknowledgementSet;
                 });
 
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final String body = "{\"event\": \"test\"}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-callback");
-        final Map<String, Object> createBody = parseResponse(service.handleEvent(serviceRequestContext, request));
+        final Map<String, Object> createBody = parseResponse(service.handleEvent(request));
 
         assertThat(callbackRef.get(), notNullValue());
         callbackRef.get().accept(true);
@@ -595,6 +599,33 @@ class SplunkHecServiceAckTest {
     }
 
     @Test
+    void acknowledgement_callback_with_false_clears_the_pending_ack() throws Exception {
+        final ArgumentCaptor<AtomicLong> pendingCaptor = ArgumentCaptor.forClass(AtomicLong.class);
+        final AtomicReference<Consumer<Boolean>> callbackRef = new AtomicReference<>();
+        when(acknowledgementSetManager.create(any(Consumer.class), any(Duration.class)))
+                .thenAnswer(invocation -> {
+                    callbackRef.set(invocation.getArgument(0));
+                    return acknowledgementSet;
+                });
+
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
+
+        verify(pluginMetrics, atLeastOnce())
+                .gauge(eq(HecAckManager.ACK_PENDING), pendingCaptor.capture(), any(ToDoubleFunction.class));
+        final AtomicLong pendingAcks = pendingCaptor.getValue();
+
+        final AggregatedHttpRequest request =
+                createRequestWithChannel("{\"event\": \"test\"}", authHeader, "ch-pending-false");
+        parseResponse(service.handleEvent(request));
+
+        assertThat(pendingAcks.get(), equalTo(1L));
+
+        callbackRef.get().accept(false);
+
+        assertThat(pendingAcks.get(), equalTo(0L));
+    }
+
+    @Test
     void acknowledgement_callback_with_false_does_not_confirm_ack() throws Exception {
         final AtomicReference<Consumer<Boolean>> callbackRef =
                 new AtomicReference<>();
@@ -604,11 +635,11 @@ class SplunkHecServiceAckTest {
                     return acknowledgementSet;
                 });
 
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final String body = "{\"event\": \"test\"}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-callback-false");
-        final Map<String, Object> createBody = parseResponse(service.handleEvent(serviceRequestContext, request));
+        final Map<String, Object> createBody = parseResponse(service.handleEvent(request));
 
         assertThat(callbackRef.get(), notNullValue());
         callbackRef.get().accept(false);
@@ -631,12 +662,12 @@ class SplunkHecServiceAckTest {
                     return acknowledgementSet;
                 });
 
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final String body = "raw line";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-raw-cb");
         final Map<String, Object> createBody =
-                parseResponse(service.handleRaw(serviceRequestContext, request, null, null, null, null));
+                parseResponse(service.handleRaw(request, null, null, null, null));
 
         assertThat(callbackRef.get(), notNullValue());
         callbackRef.get().accept(true);
@@ -658,12 +689,12 @@ class SplunkHecServiceAckTest {
                     return acknowledgementSet;
                 });
 
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final String body = "raw line";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "ch-raw-cb-f");
         final Map<String, Object> createBody =
-                parseResponse(service.handleRaw(serviceRequestContext, request, null, null, null, null));
+                parseResponse(service.handleRaw(request, null, null, null, null));
 
         assertThat(callbackRef.get(), notNullValue());
         callbackRef.get().accept(false);

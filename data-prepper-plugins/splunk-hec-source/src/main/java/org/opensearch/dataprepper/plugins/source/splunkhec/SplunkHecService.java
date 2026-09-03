@@ -16,7 +16,7 @@ import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
-import com.linecorp.armeria.server.ServiceRequestContext;
+import com.linecorp.armeria.common.annotation.Nullable;
 import com.linecorp.armeria.server.annotation.Blocking;
 import com.linecorp.armeria.server.annotation.Get;
 import com.linecorp.armeria.server.annotation.Param;
@@ -30,31 +30,22 @@ import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSet;
 import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.buffer.Buffer;
 import org.opensearch.dataprepper.model.event.Event;
-import org.opensearch.dataprepper.model.event.EventType;
-import org.opensearch.dataprepper.model.event.JacksonEvent;
+import org.opensearch.dataprepper.model.event.EventFactory;
 import org.opensearch.dataprepper.model.record.Record;
 import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecAckResponse;
-import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecMetadataKeyAttributes;
 import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecResponse;
 import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecResponseCode;
 import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecTokenConfig;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.time.DateTimeException;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
-
-import com.linecorp.armeria.common.annotation.Nullable;
 
 @Blocking
 public class SplunkHecService implements BaseHttpService {
@@ -71,34 +62,21 @@ public class SplunkHecService implements BaseHttpService {
     static final String BUFFER_FULL_TOTAL = "bufferFullTotal";
     static final String PARSE_ERRORS_TOTAL = "parseErrorsTotal";
 
-    private static final Logger LOG = LoggerFactory.getLogger(SplunkHecService.class);
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-    private static final String EVENT_FIELD = "event";
-    private static final String TIME_FIELD = "time";
-    private static final String HOST_FIELD = "host";
-    private static final String SOURCE_FIELD = "source";
-    private static final String SOURCETYPE_FIELD = "sourcetype";
-    private static final String INDEX_FIELD = "index";
-    private static final String FIELDS_FIELD = "fields";
-    private static final String MESSAGE_FIELD = "message";
-    private static final String TIMESTAMP_FIELD = "@timestamp";
+    private static final String ACKS_FIELD = "acks";
     private static final String CHANNEL_HEADER = "X-Splunk-Request-Channel";
-    private static final Duration ONE_HOUR = Duration.ofHours(1);
     private static final TypeReference<Map<String, Object>> MAP_TYPE_REF = new TypeReference<>() { };
 
     private final Buffer<Record<Event>> buffer;
     private final int bufferWriteTimeoutInMillis;
     private final HecTokenValidator tokenValidator;
     private final HecEventParser eventParser;
+    private final HecEventBuilder eventBuilder;
     private final HecAckManager ackManager;
     private final boolean acknowledgements;
-    private final boolean flattenEvent;
-    private final String rawLineBreaker;
     private final Pattern rawLineBreakerPattern;
-    private final String defaultSourcetype;
-    private final boolean warnFutureTimestamps;
     private final AcknowledgementSetManager acknowledgementSetManager;
-    private final Duration ackExpiry;
+    private final Duration acknowledgementExpiry;
 
     private final Counter requestsReceivedCounter;
     private final Counter requestsSuccessCounter;
@@ -116,7 +94,8 @@ public class SplunkHecService implements BaseHttpService {
                             final Buffer<Record<Event>> buffer,
                             final PluginMetrics pluginMetrics,
                             final SplunkHecSourceConfig config,
-                            final AcknowledgementSetManager acknowledgementSetManager) {
+                            final AcknowledgementSetManager acknowledgementSetManager,
+                            final EventFactory eventFactory) {
         Objects.requireNonNull(buffer, "buffer must not be null");
         Objects.requireNonNull(pluginMetrics, "pluginMetrics must not be null");
         Objects.requireNonNull(config, "config must not be null");
@@ -124,17 +103,14 @@ public class SplunkHecService implements BaseHttpService {
         this.bufferWriteTimeoutInMillis = bufferWriteTimeoutInMillis;
         this.tokenValidator = new HecTokenValidator(config.getTokens());
         this.eventParser = new HecEventParser();
+        this.eventBuilder = new HecEventBuilder(eventFactory, config);
         this.acknowledgements = config.isAcknowledgements();
-        this.flattenEvent = config.isFlattenEvent();
-        this.rawLineBreaker = config.getRawLineBreaker();
-        this.rawLineBreakerPattern = Pattern.compile(Pattern.quote(rawLineBreaker));
-        this.defaultSourcetype = config.getDefaultSourcetype();
-        this.warnFutureTimestamps = config.isWarnFutureTimestamps();
+        this.rawLineBreakerPattern = Pattern.compile(Pattern.quote(config.getRawLineBreaker()));
         this.acknowledgementSetManager = acknowledgementSetManager;
-        this.ackExpiry = config.getAckExpiry();
+        this.acknowledgementExpiry = config.getAcknowledgementExpiry();
 
         if (acknowledgements) {
-            this.ackManager = new HecAckManager(config.getAckExpiry(), pluginMetrics);
+            this.ackManager = new HecAckManager(config.getAcknowledgementExpiry(), pluginMetrics);
         } else {
             this.ackManager = null;
         }
@@ -153,68 +129,25 @@ public class SplunkHecService implements BaseHttpService {
     }
 
     @Post("/event")
-    public HttpResponse handleEvent(final ServiceRequestContext serviceRequestContext,
-                                    final AggregatedHttpRequest request) {
-        return requestLatencyTimer.record(() -> processEventRequest(serviceRequestContext, request));
+    public HttpResponse handleEvent(final AggregatedHttpRequest request) {
+        return handleIngestRequest(request, (content, defaults, channel) ->
+                eventBuilder.buildFromHecEvents(eventParser.parse(content), defaults, channel));
     }
 
     @Post("/raw")
-    public HttpResponse handleRaw(final ServiceRequestContext serviceRequestContext,
-                                  final AggregatedHttpRequest request,
-                                  @Param("index") @Nullable String index,
-                                  @Param("sourcetype") @Nullable String sourcetype,
-                                  @Param("source") @Nullable String source,
-                                  @Param("host") @Nullable String host) {
-        return requestLatencyTimer.record(() ->
-                processRawRequest(serviceRequestContext, request, index, sourcetype, source, host));
+    public HttpResponse handleRaw(final AggregatedHttpRequest request,
+                                  @Param("index") @Nullable final String index,
+                                  @Param("sourcetype") @Nullable final String sourcetype,
+                                  @Param("source") @Nullable final String source,
+                                  @Param("host") @Nullable final String host) {
+        return handleIngestRequest(request, (content, defaults, channel) ->
+                eventBuilder.buildFromRawLines(rawLineBreakerPattern.split(content),
+                        index, sourcetype, source, host, defaults, channel));
     }
 
     @Post("/ack")
     public HttpResponse handleAck(final AggregatedHttpRequest request) {
-        requestsReceivedCounter.increment();
-        if (!acknowledgements) {
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.ACK_DISABLED));
-        }
-
-        final AuthResult auth = authenticate(request);
-        if (!auth.isAuthenticated()) {
-            return buildJsonResponse(auth.status, HecResponse.error(auth.code));
-        }
-
-        final String channel = request.headers().get(CHANNEL_HEADER);
-        if (channel == null || channel.isBlank()) {
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.DATA_CHANNEL_MISSING));
-        }
-
-        try {
-            final Map<String, Object> body = OBJECT_MAPPER.readValue(request.content().toStringUtf8(), MAP_TYPE_REF);
-            if (body == null) {
-                requestsFailedCounter.increment();
-                return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.INVALID_DATA_FORMAT));
-            }
-            final Object acksValue = body.get("acks");
-            if (!(acksValue instanceof List)) {
-                requestsFailedCounter.increment();
-                return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.INVALID_DATA_FORMAT));
-            }
-            final List<Long> ids = new ArrayList<>();
-            for (final Object id : (List<?>) acksValue) {
-                if (!(id instanceof Number)) {
-                    requestsFailedCounter.increment();
-                    return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.INVALID_DATA_FORMAT));
-                }
-                ids.add(((Number) id).longValue());
-            }
-            final Map<String, Boolean> results = ackManager.queryAcks(channel, ids);
-            requestsSuccessCounter.increment();
-            return buildJsonResponse(HttpStatus.OK, new HecAckResponse(results));
-        } catch (IOException e) {
-            parseErrorsCounter.increment();
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.INVALID_DATA_FORMAT));
-        }
+        return requestLatencyTimer.record(() -> processAckRequest(request));
     }
 
     @Get("/health")
@@ -228,436 +161,161 @@ public class SplunkHecService implements BaseHttpService {
         }
     }
 
-    private HttpResponse processEventRequest(final ServiceRequestContext serviceRequestContext,
-                                             final AggregatedHttpRequest request) {
-        requestsReceivedCounter.increment();
-        requestSizeSummary.record(request.content().length());
+    private HttpResponse handleIngestRequest(final AggregatedHttpRequest request, final RecordBuilder recordBuilder) {
+        return requestLatencyTimer.record(() -> {
+            requestsReceivedCounter.increment();
+            requestSizeSummary.record(request.content().length());
 
-        final AuthResult auth = authenticate(request);
-        if (!auth.isAuthenticated()) {
-            return buildJsonResponse(auth.status, HecResponse.error(auth.code));
-        }
-        final String token = auth.token;
+            final AuthResult auth = authenticate(request);
+            if (!auth.isAuthenticated()) {
+                return buildJsonResponse(auth.status, HecResponse.error(auth.code));
+            }
 
-        if (acknowledgements) {
             final String channel = request.headers().get(CHANNEL_HEADER);
-            if (channel == null || channel.isBlank()) {
+            if (acknowledgements && isBlank(channel)) {
+                requestsFailedCounter.increment();
+                return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.DATA_CHANNEL_MISSING));
+            }
+
+            final HecTokenConfig.HecTokenDefaults defaults = tokenValidator.getDefaults(auth.token).orElse(null);
+
+            final List<Record<Event>> records;
+            try {
+                records = recordBuilder.build(request.content().toStringUtf8(), defaults, channel);
+            } catch (final HecParseException e) {
+                parseErrorsCounter.increment();
                 requestsFailedCounter.increment();
                 return buildJsonResponse(HttpStatus.BAD_REQUEST,
-                        HecResponse.error(HecResponseCode.DATA_CHANNEL_MISSING));
-            }
-            return processEventWithAck(serviceRequestContext, request, token, channel);
-        }
-
-        return processEventWithoutAck(serviceRequestContext, request, token);
-    }
-
-    private HttpResponse processEventWithAck(final ServiceRequestContext serviceRequestContext,
-                                             final AggregatedHttpRequest request,
-                                             final String token,
-                                             final String channel) {
-        final List<Map<String, Object>> parsedEvents;
-        try {
-            parsedEvents = eventParser.parse(request.content().toStringUtf8());
-        } catch (HecParseException e) {
-            parseErrorsCounter.increment();
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST,
-                    HecResponse.errorWithInvalidEventNumber(HecResponseCode.INVALID_DATA_FORMAT, e.getEventNumber()));
-        }
-
-        if (parsedEvents.isEmpty()) {
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST,
-                    HecResponse.error(HecResponseCode.NO_DATA));
-        }
-
-        final List<Record<Event>> records;
-        try {
-            records = mapEventsToRecords(parsedEvents, token, channel);
-        } catch (HecEventValidationException e) {
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST,
-                    HecResponse.errorWithInvalidEventNumber(HecResponseCode.EVENT_FIELD_REQUIRED, e.getEventNumber()));
-        }
-
-        eventsReceivedCounter.increment(records.size());
-        eventsPerRequestSummary.record(records.size());
-
-        final long ackId = ackManager.createAck(channel);
-        final AcknowledgementSet acknowledgementSet = acknowledgementSetManager.create(
-                result -> {
-                    if (Boolean.TRUE.equals(result)) {
-                        ackManager.confirmAck(channel, ackId);
-                    }
-                }, ackExpiry);
-
-        for (final Record<Event> record : records) {
-            acknowledgementSet.add(record.getData());
-        }
-
-        try {
-            buffer.writeAll(records, bufferWriteTimeoutInMillis);
-        } catch (TimeoutException e) {
-            acknowledgementSet.cancel();
-            ackManager.removeAck(channel, ackId);
-            bufferFullCounter.increment();
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.SERVICE_UNAVAILABLE,
-                    HecResponse.error(HecResponseCode.SERVER_BUSY));
-        } catch (Exception e) {
-            acknowledgementSet.cancel();
-            ackManager.removeAck(channel, ackId);
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.INTERNAL_SERVER_ERROR,
-                    HecResponse.error(HecResponseCode.INTERNAL_SERVER_ERROR));
-        }
-
-        acknowledgementSet.complete();
-        eventsWrittenCounter.increment(records.size());
-        requestsSuccessCounter.increment();
-        return buildJsonResponse(HttpStatus.OK, HecResponse.successWithAckId(ackId));
-    }
-
-    private HttpResponse processEventWithoutAck(final ServiceRequestContext serviceRequestContext,
-                                                final AggregatedHttpRequest request,
-                                                final String token) {
-        final List<Map<String, Object>> parsedEvents;
-        try {
-            parsedEvents = eventParser.parse(request.content().toStringUtf8());
-        } catch (HecParseException e) {
-            parseErrorsCounter.increment();
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST,
-                    HecResponse.errorWithInvalidEventNumber(HecResponseCode.INVALID_DATA_FORMAT, e.getEventNumber()));
-        }
-
-        if (parsedEvents.isEmpty()) {
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST,
-                    HecResponse.error(HecResponseCode.NO_DATA));
-        }
-
-        final String channel = request.headers().get(CHANNEL_HEADER);
-        final List<Record<Event>> records;
-        try {
-            records = mapEventsToRecords(parsedEvents, token, channel);
-        } catch (HecEventValidationException e) {
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST,
-                    HecResponse.errorWithInvalidEventNumber(HecResponseCode.EVENT_FIELD_REQUIRED, e.getEventNumber()));
-        }
-
-        eventsReceivedCounter.increment(records.size());
-        eventsPerRequestSummary.record(records.size());
-
-        try {
-            buffer.writeAll(records, bufferWriteTimeoutInMillis);
-        } catch (TimeoutException e) {
-            bufferFullCounter.increment();
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.SERVICE_UNAVAILABLE,
-                    HecResponse.error(HecResponseCode.SERVER_BUSY));
-        } catch (Exception e) {
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.INTERNAL_SERVER_ERROR,
-                    HecResponse.error(HecResponseCode.INTERNAL_SERVER_ERROR));
-        }
-
-        eventsWrittenCounter.increment(records.size());
-        requestsSuccessCounter.increment();
-        return buildJsonResponse(HttpStatus.OK, HecResponse.success());
-    }
-
-    private HttpResponse processRawRequest(final ServiceRequestContext serviceRequestContext,
-                                           final AggregatedHttpRequest request,
-                                           final String index,
-                                           final String sourcetype,
-                                           final String source,
-                                           final String host) {
-        requestsReceivedCounter.increment();
-        requestSizeSummary.record(request.content().length());
-
-        final AuthResult auth = authenticate(request);
-        if (!auth.isAuthenticated()) {
-            return buildJsonResponse(auth.status, HecResponse.error(auth.code));
-        }
-        final String token = auth.token;
-
-        final String channel = request.headers().get(CHANNEL_HEADER);
-        if (acknowledgements) {
-            if (channel == null || channel.isBlank()) {
+                        HecResponse.errorWithInvalidEventNumber(HecResponseCode.INVALID_DATA_FORMAT, e.getEventNumber()));
+            } catch (final HecEventValidationException e) {
                 requestsFailedCounter.increment();
                 return buildJsonResponse(HttpStatus.BAD_REQUEST,
-                        HecResponse.error(HecResponseCode.DATA_CHANNEL_MISSING));
+                        HecResponse.errorWithInvalidEventNumber(HecResponseCode.EVENT_FIELD_REQUIRED, e.getEventNumber()));
             }
-        }
 
-        final String body = request.content().toStringUtf8();
-        if (body.isEmpty()) {
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST,
-                    HecResponse.error(HecResponseCode.NO_DATA));
-        }
-
-        final String[] lines = rawLineBreakerPattern.split(body);
-        final Optional<HecTokenConfig.HecTokenDefaults> defaults = tokenValidator.getDefaults(token);
-
-        final String effectiveIndex = resolveField(index, defaults.map(HecTokenConfig.HecTokenDefaults::getIndex).orElse(null));
-        final String effectiveSourcetype = resolveField(sourcetype,
-                defaults.map(HecTokenConfig.HecTokenDefaults::getSourcetype).orElse(defaultSourcetype));
-        final String effectiveSource = resolveField(source, defaults.map(HecTokenConfig.HecTokenDefaults::getSource).orElse(null));
-        final String effectiveHost = resolveField(host, defaults.map(HecTokenConfig.HecTokenDefaults::getHost).orElse(null));
-
-        final List<Record<Event>> records = new ArrayList<>();
-        for (final String line : lines) {
-            if (line.isEmpty()) {
-                continue;
+            if (records.isEmpty()) {
+                requestsFailedCounter.increment();
+                return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.NO_DATA));
             }
-            final Map<String, Object> data = new HashMap<>();
-            data.put(MESSAGE_FIELD, line);
-            if (effectiveHost != null) {
-                data.put(HOST_FIELD, effectiveHost);
-            }
-            if (effectiveSource != null) {
-                data.put(SOURCE_FIELD, effectiveSource);
-            }
-            if (effectiveSourcetype != null) {
-                data.put(SOURCETYPE_FIELD, effectiveSourcetype);
-            }
-            data.put(TIMESTAMP_FIELD, Instant.now().toString());
 
-            final JacksonEvent event = JacksonEvent.builder()
-                    .withEventType(EventType.LOG.toString())
-                    .withData(data)
-                    .build();
+            return writeRecords(records, channel);
+        });
+    }
 
-            if (effectiveIndex != null) {
-                event.getMetadata().setAttribute(HecMetadataKeyAttributes.INDEX, effectiveIndex);
-            }
-            if (channel != null) {
-                event.getMetadata().setAttribute(HecMetadataKeyAttributes.CHANNEL, channel);
-            }
-            records.add(new Record<>(event));
-        }
-
-        if (records.isEmpty()) {
-            requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.BAD_REQUEST,
-                    HecResponse.error(HecResponseCode.NO_DATA));
-        }
-
+    private HttpResponse writeRecords(final List<Record<Event>> records, final String channel) {
         eventsReceivedCounter.increment(records.size());
         eventsPerRequestSummary.record(records.size());
 
+        Long ackId = null;
+        AcknowledgementSet acknowledgementSet = null;
         if (acknowledgements) {
-            final long ackId = ackManager.createAck(channel);
-            final AcknowledgementSet acknowledgementSet = acknowledgementSetManager.create(
-                    result -> {
-                        if (Boolean.TRUE.equals(result)) {
-                            ackManager.confirmAck(channel, ackId);
-                        }
-                    }, ackExpiry);
+            final long createdAckId = ackManager.createAck(channel);
+            ackId = createdAckId;
+            acknowledgementSet = acknowledgementSetManager.create(result -> {
+                if (Boolean.TRUE.equals(result)) {
+                    ackManager.confirmAck(channel, createdAckId);
+                } else {
+                    ackManager.removeAck(channel, createdAckId);
+                }
+            }, acknowledgementExpiry);
 
             for (final Record<Event> record : records) {
                 acknowledgementSet.add(record.getData());
             }
-
-            try {
-                buffer.writeAll(records, bufferWriteTimeoutInMillis);
-            } catch (TimeoutException e) {
-                acknowledgementSet.cancel();
-                ackManager.removeAck(channel, ackId);
-                bufferFullCounter.increment();
-                requestsFailedCounter.increment();
-                return buildJsonResponse(HttpStatus.SERVICE_UNAVAILABLE,
-                        HecResponse.error(HecResponseCode.SERVER_BUSY));
-            } catch (Exception e) {
-                acknowledgementSet.cancel();
-                ackManager.removeAck(channel, ackId);
-                requestsFailedCounter.increment();
-                return buildJsonResponse(HttpStatus.INTERNAL_SERVER_ERROR,
-                        HecResponse.error(HecResponseCode.INTERNAL_SERVER_ERROR));
-            }
-
-            acknowledgementSet.complete();
-            eventsWrittenCounter.increment(records.size());
-            requestsSuccessCounter.increment();
-            return buildJsonResponse(HttpStatus.OK, HecResponse.successWithAckId(ackId));
         }
 
         try {
             buffer.writeAll(records, bufferWriteTimeoutInMillis);
-        } catch (TimeoutException e) {
+        } catch (final TimeoutException e) {
+            discardAcknowledgement(acknowledgementSet, channel, ackId);
             bufferFullCounter.increment();
             requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.SERVICE_UNAVAILABLE,
-                    HecResponse.error(HecResponseCode.SERVER_BUSY));
-        } catch (Exception e) {
+            return buildJsonResponse(HttpStatus.SERVICE_UNAVAILABLE, HecResponse.error(HecResponseCode.SERVER_BUSY));
+        } catch (final Exception e) {
+            discardAcknowledgement(acknowledgementSet, channel, ackId);
             requestsFailedCounter.increment();
-            return buildJsonResponse(HttpStatus.INTERNAL_SERVER_ERROR,
-                    HecResponse.error(HecResponseCode.INTERNAL_SERVER_ERROR));
+            return buildJsonResponse(HttpStatus.INTERNAL_SERVER_ERROR, HecResponse.error(HecResponseCode.INTERNAL_SERVER_ERROR));
         }
 
+        if (acknowledgementSet != null) {
+            acknowledgementSet.complete();
+        }
         eventsWrittenCounter.increment(records.size());
         requestsSuccessCounter.increment();
-        return buildJsonResponse(HttpStatus.OK, HecResponse.success());
+
+        return ackId == null
+                ? buildJsonResponse(HttpStatus.OK, HecResponse.success())
+                : buildJsonResponse(HttpStatus.OK, HecResponse.successWithAckId(ackId));
     }
 
-    private List<Record<Event>> mapEventsToRecords(final List<Map<String, Object>> parsedEvents,
-                                                   final String token,
-                                                   final String channel) {
-        final Optional<HecTokenConfig.HecTokenDefaults> defaults = tokenValidator.getDefaults(token);
-        final List<Record<Event>> records = new ArrayList<>();
-
-        for (int i = 0; i < parsedEvents.size(); i++) {
-            final Map<String, Object> hecEvent = parsedEvents.get(i);
-            if (!hecEvent.containsKey(EVENT_FIELD) || hecEvent.get(EVENT_FIELD) == null) {
-                throw new HecEventValidationException(i);
-            }
-
-            final Object eventValue = hecEvent.get(EVENT_FIELD);
-            final Map<String, Object> eventData = buildEventData(hecEvent, eventValue, defaults.orElse(null));
-            handleTimestamp(hecEvent, eventData);
-
-            final JacksonEvent event = JacksonEvent.builder()
-                    .withEventType(EventType.LOG.toString())
-                    .withData(eventData)
-                    .build();
-
-            setEventMetadata(event, hecEvent, defaults.orElse(null), channel);
-            records.add(new Record<>(event));
+    private void discardAcknowledgement(final AcknowledgementSet acknowledgementSet,
+                                        final String channel,
+                                        final Long ackId) {
+        if (acknowledgementSet == null) {
+            return;
         }
-
-        return records;
+        acknowledgementSet.cancel();
+        ackManager.removeAck(channel, ackId);
     }
 
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> buildEventData(final Map<String, Object> hecEvent,
-                                               final Object eventValue,
-                                               final HecTokenConfig.HecTokenDefaults defaults) {
-        final Map<String, Object> eventData = new HashMap<>();
+    private HttpResponse processAckRequest(final AggregatedHttpRequest request) {
+        requestsReceivedCounter.increment();
 
-        if (eventValue instanceof Map) {
-            if (flattenEvent) {
-                eventData.putAll((Map<String, Object>) eventValue);
-            } else {
-                eventData.put(EVENT_FIELD, eventValue);
-            }
-        } else if (eventValue instanceof String) {
-            eventData.put(MESSAGE_FIELD, eventValue);
-        } else {
-            eventData.put(EVENT_FIELD, eventValue);
+        final AuthResult auth = authenticate(request);
+        if (!auth.isAuthenticated()) {
+            return buildJsonResponse(auth.status, HecResponse.error(auth.code));
         }
 
-        final String host = asString(hecEvent.get(HOST_FIELD));
-        final String source = asString(hecEvent.get(SOURCE_FIELD));
-        final String sourcetype = asString(hecEvent.get(SOURCETYPE_FIELD));
-
-        final String effectiveHost = resolveField(host, defaults != null ? defaults.getHost() : null);
-        final String effectiveSource = resolveField(source, defaults != null ? defaults.getSource() : null);
-        final String effectiveSourcetype = resolveField(sourcetype,
-                defaults != null && defaults.getSourcetype() != null ? defaults.getSourcetype() : defaultSourcetype);
-
-        if (effectiveHost != null) {
-            eventData.put(HOST_FIELD, effectiveHost);
-        }
-        if (effectiveSource != null) {
-            eventData.put(SOURCE_FIELD, effectiveSource);
-        }
-        if (effectiveSourcetype != null) {
-            eventData.put(SOURCETYPE_FIELD, effectiveSourcetype);
+        if (!acknowledgements) {
+            requestsFailedCounter.increment();
+            return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.ACK_DISABLED));
         }
 
-        final Object fields = hecEvent.get(FIELDS_FIELD);
-        if (fields instanceof Map) {
-            eventData.putAll((Map<String, Object>) fields);
+        final String channel = request.headers().get(CHANNEL_HEADER);
+        if (isBlank(channel)) {
+            requestsFailedCounter.increment();
+            return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.DATA_CHANNEL_MISSING));
         }
 
-        if (defaults != null && defaults.getFields() != null) {
-            for (final Map.Entry<String, String> entry : defaults.getFields().entrySet()) {
-                eventData.putIfAbsent(entry.getKey(), entry.getValue());
-            }
+        final List<Long> ids;
+        try {
+            ids = parseAckIds(request.content().toStringUtf8());
+        } catch (final IOException e) {
+            parseErrorsCounter.increment();
+            requestsFailedCounter.increment();
+            return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.INVALID_DATA_FORMAT));
+        } catch (final IllegalArgumentException e) {
+            requestsFailedCounter.increment();
+            return buildJsonResponse(HttpStatus.BAD_REQUEST, HecResponse.error(HecResponseCode.INVALID_DATA_FORMAT));
         }
 
-        return eventData;
+        final Map<String, Boolean> results = ackManager.queryAcks(channel, ids);
+        requestsSuccessCounter.increment();
+        return buildJsonResponse(HttpStatus.OK, new HecAckResponse(results));
     }
 
-    private void handleTimestamp(final Map<String, Object> hecEvent, final Map<String, Object> eventData) {
-        final Object timeValue = hecEvent.get(TIME_FIELD);
-        if (timeValue != null) {
-            final double epochSeconds;
-            if (timeValue instanceof Number) {
-                epochSeconds = ((Number) timeValue).doubleValue();
-            } else {
-                try {
-                    epochSeconds = Double.parseDouble(timeValue.toString());
-                } catch (final NumberFormatException e) {
-                    eventData.put(TIMESTAMP_FIELD, Instant.now().toString());
-                    return;
-                }
+    private List<Long> parseAckIds(final String content) throws IOException {
+        final Map<String, Object> body = OBJECT_MAPPER.readValue(content, MAP_TYPE_REF);
+        if (body == null) {
+            throw new IllegalArgumentException("The acknowledgement request body must be a JSON object.");
+        }
+        final Object acksValue = body.get(ACKS_FIELD);
+        if (!(acksValue instanceof List)) {
+            throw new IllegalArgumentException("The acknowledgement request must provide an acks array.");
+        }
+        final List<Long> ids = new ArrayList<>();
+        for (final Object id : (List<?>) acksValue) {
+            if (!(id instanceof Number)) {
+                throw new IllegalArgumentException("Every acknowledgement id must be a number.");
             }
-            if (!Double.isFinite(epochSeconds)) {
-                eventData.put(TIMESTAMP_FIELD, Instant.now().toString());
-                return;
-            }
-            final Instant timestamp;
-            try {
-                final long seconds = (long) epochSeconds;
-                final long nanos = (long) ((epochSeconds - seconds) * 1_000_000_000);
-                timestamp = Instant.ofEpochSecond(seconds, nanos);
-            } catch (final ArithmeticException | DateTimeException e) {
-                eventData.put(TIMESTAMP_FIELD, Instant.now().toString());
-                return;
-            }
-
-            if (warnFutureTimestamps && timestamp.isAfter(Instant.now().plus(ONE_HOUR))) {
-                LOG.warn("Event has timestamp more than 1 hour in the future: {}", timestamp);
-            }
-
-            eventData.put(TIMESTAMP_FIELD, timestamp.toString());
-        } else {
-            eventData.put(TIMESTAMP_FIELD, Instant.now().toString());
+            ids.add(((Number) id).longValue());
         }
-    }
-
-    private void setEventMetadata(final JacksonEvent event,
-                                  final Map<String, Object> hecEvent,
-                                  final HecTokenConfig.HecTokenDefaults defaults,
-                                  final String channel) {
-        final String index = asString(hecEvent.get(INDEX_FIELD));
-        final String effectiveIndex = resolveField(index, defaults != null ? defaults.getIndex() : null);
-
-        if (effectiveIndex != null) {
-            event.getMetadata().setAttribute(HecMetadataKeyAttributes.INDEX, effectiveIndex);
-        }
-        if (channel != null) {
-            event.getMetadata().setAttribute(HecMetadataKeyAttributes.CHANNEL, channel);
-        }
-
-        final String sourcetype = asString(hecEvent.get(SOURCETYPE_FIELD));
-        final String effectiveSourcetype = resolveField(sourcetype,
-                defaults != null && defaults.getSourcetype() != null ? defaults.getSourcetype() : defaultSourcetype);
-        if (effectiveSourcetype != null) {
-            event.getMetadata().setAttribute(HecMetadataKeyAttributes.SOURCETYPE, effectiveSourcetype);
-        }
-
-        final String source = asString(hecEvent.get(SOURCE_FIELD));
-        final String effectiveSource = resolveField(source, defaults != null ? defaults.getSource() : null);
-        if (effectiveSource != null) {
-            event.getMetadata().setAttribute(HecMetadataKeyAttributes.SOURCE, effectiveSource);
-        }
-
-        final String host = asString(hecEvent.get(HOST_FIELD));
-        final String effectiveHost = resolveField(host, defaults != null ? defaults.getHost() : null);
-        if (effectiveHost != null) {
-            event.getMetadata().setAttribute(HecMetadataKeyAttributes.HOST, effectiveHost);
-        }
+        return ids;
     }
 
     private AuthResult authenticate(final AggregatedHttpRequest request) {
         final String authHeader = request.headers().get(HttpHeaderNames.AUTHORIZATION);
-        if (authHeader == null || authHeader.isBlank()) {
+        if (isBlank(authHeader)) {
             requestsAuthFailedCounter.increment();
             return AuthResult.tokenRequired();
         }
@@ -678,20 +336,19 @@ public class SplunkHecService implements BaseHttpService {
         return AuthResult.valid(token);
     }
 
-    private String resolveField(final String explicit, final String defaultValue) {
-        if (explicit != null && !explicit.isBlank()) {
-            return explicit;
-        }
-        return defaultValue;
-    }
-
-    private static String asString(final Object value) {
-        return value == null ? null : value.toString();
+    private static boolean isBlank(final String value) {
+        return value == null || value.isBlank();
     }
 
     private HttpResponse buildJsonResponse(final HttpStatus status, final Object body) {
         final String json = OBJECT_MAPPER.valueToTree(body).toString();
         return HttpResponse.of(status, MediaType.JSON, json);
+    }
+
+    @FunctionalInterface
+    private interface RecordBuilder {
+        List<Record<Event>> build(String content, HecTokenConfig.HecTokenDefaults defaults, String channel)
+                throws HecParseException;
     }
 
     private static final class AuthResult {
@@ -727,19 +384,6 @@ public class SplunkHecService implements BaseHttpService {
 
         boolean isAuthenticated() {
             return token != null;
-        }
-    }
-
-    private static class HecEventValidationException extends RuntimeException {
-        private final int eventNumber;
-
-        HecEventValidationException(final int eventNumber) {
-            super("Event field is required at event number " + eventNumber);
-            this.eventNumber = eventNumber;
-        }
-
-        int getEventNumber() {
-            return eventNumber;
         }
     }
 }

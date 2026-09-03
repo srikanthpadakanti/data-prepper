@@ -15,11 +15,13 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.dataprepper.http.BaseHttpService;
+import org.opensearch.dataprepper.event.TestEventFactory;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.buffer.Buffer;
 import org.opensearch.dataprepper.model.configuration.PipelineDescription;
 import org.opensearch.dataprepper.model.event.Event;
+import org.opensearch.dataprepper.model.event.EventFactory;
 import org.opensearch.dataprepper.model.plugin.PluginFactory;
 import org.opensearch.dataprepper.model.record.Record;
 import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecTokenConfig;
@@ -37,6 +39,8 @@ import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 class SplunkHecSourceTest {
+
+    private static final EventFactory TEST_EVENT_FACTORY = TestEventFactory.getTestEventFactory();
 
     @Mock
     private SplunkHecSourceConfig sourceConfig;
@@ -82,19 +86,19 @@ class SplunkHecSourceTest {
         lenient().when(sourceConfig.isFlattenEvent()).thenReturn(true);
 
         splunkHecSource = new SplunkHecSource(sourceConfig, pluginMetrics, pluginFactory,
-                pipelineDescription, acknowledgementSetManager);
+                pipelineDescription, acknowledgementSetManager, TEST_EVENT_FACTORY);
     }
 
     @Test
     void constructor_with_null_sourceConfig_throws_NullPointerException() {
         assertThrows(NullPointerException.class, () ->
-                new SplunkHecSource(null, pluginMetrics, pluginFactory, pipelineDescription, acknowledgementSetManager));
+                new SplunkHecSource(null, pluginMetrics, pluginFactory, pipelineDescription, acknowledgementSetManager, TEST_EVENT_FACTORY));
     }
 
     @Test
     void constructor_with_null_acknowledgementSetManager_throws_NullPointerException() {
         assertThrows(NullPointerException.class, () ->
-                new SplunkHecSource(sourceConfig, pluginMetrics, pluginFactory, pipelineDescription, null));
+                new SplunkHecSource(sourceConfig, pluginMetrics, pluginFactory, pipelineDescription, null, TEST_EVENT_FACTORY));
     }
 
     @Test

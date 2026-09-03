@@ -19,6 +19,7 @@ import org.opensearch.dataprepper.model.annotations.Experimental;
 import org.opensearch.dataprepper.model.buffer.Buffer;
 import org.opensearch.dataprepper.model.configuration.PipelineDescription;
 import org.opensearch.dataprepper.model.event.Event;
+import org.opensearch.dataprepper.model.event.EventFactory;
 import org.opensearch.dataprepper.model.plugin.PluginFactory;
 import org.opensearch.dataprepper.model.record.Record;
 import org.opensearch.dataprepper.model.source.Source;
@@ -34,6 +35,7 @@ public class SplunkHecSource extends BaseHttpSource<Record<Event>> {
 
     private final SplunkHecSourceConfig sourceConfig;
     private final AcknowledgementSetManager acknowledgementSetManager;
+    private final EventFactory eventFactory;
     private volatile SplunkHecService splunkHecService;
 
     @DataPrepperPluginConstructor
@@ -41,12 +43,14 @@ public class SplunkHecSource extends BaseHttpSource<Record<Event>> {
                            final PluginMetrics pluginMetrics,
                            final PluginFactory pluginFactory,
                            final PipelineDescription pipelineDescription,
-                           final AcknowledgementSetManager acknowledgementSetManager) {
+                           final AcknowledgementSetManager acknowledgementSetManager,
+                           final EventFactory eventFactory) {
         super(sourceConfig, pluginMetrics, pluginFactory, pipelineDescription, SOURCE_NAME,
                 LoggerFactory.getLogger(SplunkHecSource.class));
         this.sourceConfig = Objects.requireNonNull(sourceConfig, "sourceConfig must not be null");
         this.acknowledgementSetManager = Objects.requireNonNull(acknowledgementSetManager,
                 "acknowledgementSetManager must not be null");
+        this.eventFactory = Objects.requireNonNull(eventFactory, "eventFactory must not be null");
     }
 
     @Override
@@ -61,7 +65,7 @@ public class SplunkHecSource extends BaseHttpSource<Record<Event>> {
                                             final Buffer<Record<Event>> buffer,
                                             final PluginMetrics pluginMetrics) {
         return new SplunkHecService(bufferWriteTimeoutInMillis, buffer, pluginMetrics,
-                sourceConfig, acknowledgementSetManager);
+                sourceConfig, acknowledgementSetManager, eventFactory);
     }
 
     @Override

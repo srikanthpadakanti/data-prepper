@@ -13,11 +13,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.opensearch.dataprepper.event.TestEventFactory;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.buffer.Buffer;
 import org.opensearch.dataprepper.model.configuration.PipelineDescription;
 import org.opensearch.dataprepper.model.event.Event;
+import org.opensearch.dataprepper.model.event.EventFactory;
 import org.opensearch.dataprepper.model.plugin.PluginFactory;
 import org.opensearch.dataprepper.model.record.Record;
 import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecTokenConfig;
@@ -40,6 +42,8 @@ import static org.mockito.Mockito.when;
 @ExtendWith(MockitoExtension.class)
 class SplunkHecSourceStopTest {
 
+    private static final EventFactory TEST_EVENT_FACTORY = TestEventFactory.getTestEventFactory();
+
     @Mock
     private PluginMetrics pluginMetrics;
     @Mock
@@ -57,7 +61,7 @@ class SplunkHecSourceStopTest {
         when(pipelineDescription.getPipelineName()).thenReturn("test-pipeline");
 
         final SplunkHecSource source = new SplunkHecSource(config, pluginMetrics, pluginFactory,
-                pipelineDescription, acknowledgementSetManager);
+                pipelineDescription, acknowledgementSetManager, TEST_EVENT_FACTORY);
         source.stop();
 
         verifyNoInteractions(buffer);
@@ -69,7 +73,7 @@ class SplunkHecSourceStopTest {
         when(pipelineDescription.getPipelineName()).thenReturn("test-pipeline");
 
         final SplunkHecSource source = spy(new SplunkHecSource(config, pluginMetrics, pluginFactory,
-                pipelineDescription, acknowledgementSetManager));
+                pipelineDescription, acknowledgementSetManager, TEST_EVENT_FACTORY));
         final SplunkHecService service = mock(SplunkHecService.class);
         doReturn(service).when(source).createSplunkHecService(anyInt(), any(), any());
 
@@ -85,7 +89,7 @@ class SplunkHecSourceStopTest {
         when(pipelineDescription.getPipelineName()).thenReturn("test-pipeline");
 
         final SplunkHecSource source = new SplunkHecSource(configEnabled, pluginMetrics, pluginFactory,
-                pipelineDescription, acknowledgementSetManager);
+                pipelineDescription, acknowledgementSetManager, TEST_EVENT_FACTORY);
         assertThat(source.areAcknowledgementsEnabled(), is(true));
     }
 
@@ -102,7 +106,7 @@ class SplunkHecSourceStopTest {
         lenient().when(config.getBufferTimeoutInMillis()).thenReturn(8000);
         lenient().when(config.hasHealthCheckService()).thenReturn(false);
         lenient().when(config.isAcknowledgements()).thenReturn(acknowledgements);
-        lenient().when(config.getAckExpiry()).thenReturn(Duration.ofSeconds(300));
+        lenient().when(config.getAcknowledgementExpiry()).thenReturn(Duration.ofSeconds(300));
 
         final HecTokenConfig tokenConfig = mock(HecTokenConfig.class);
         lenient().when(tokenConfig.getToken()).thenReturn("test-token");

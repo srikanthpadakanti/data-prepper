@@ -23,10 +23,12 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.awaitility.Awaitility;
+import org.opensearch.dataprepper.event.TestEventFactory;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.buffer.Buffer;
 import org.opensearch.dataprepper.model.configuration.PipelineDescription;
 import org.opensearch.dataprepper.model.event.Event;
+import org.opensearch.dataprepper.model.event.EventFactory;
 import org.opensearch.dataprepper.model.plugin.PluginFactory;
 import org.opensearch.dataprepper.model.record.Record;
 import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
@@ -50,6 +52,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class SplunkHecSourceIT {
+
+    private static final EventFactory TEST_EVENT_FACTORY = TestEventFactory.getTestEventFactory();
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final String TOKEN = "test-hec-token-12345";
@@ -105,7 +109,7 @@ class SplunkHecSourceIT {
         final PluginFactory pluginFactory = mock(PluginFactory.class);
         final AcknowledgementSetManager ackManager = mock(AcknowledgementSetManager.class);
 
-        source = new SplunkHecSource(config, pluginMetrics, pluginFactory, pipelineDescription, ackManager);
+        source = new SplunkHecSource(config, pluginMetrics, pluginFactory, pipelineDescription, ackManager, TEST_EVENT_FACTORY);
         source.start(buffer);
     }
 

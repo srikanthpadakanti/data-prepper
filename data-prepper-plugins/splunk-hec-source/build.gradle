@@ -15,6 +15,7 @@ dependencies {
     implementation project(':data-prepper-plugins:armeria-common')
     implementation libs.armeria.core
     testImplementation project(':data-prepper-test:test-common')
+    testImplementation project(':data-prepper-test:test-event')
     testImplementation project(':data-prepper-api')
     testImplementation 'com.fasterxml.jackson.dataformat:jackson-dataformat-yaml'
     testImplementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310'

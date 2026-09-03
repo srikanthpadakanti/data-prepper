@@ -19,7 +19,6 @@ import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.RequestHeaders;
-import com.linecorp.armeria.server.ServiceRequestContext;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Timer;
@@ -29,11 +28,13 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.opensearch.dataprepper.event.TestEventFactory;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSet;
 import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.buffer.Buffer;
 import org.opensearch.dataprepper.model.event.Event;
+import org.opensearch.dataprepper.model.event.EventFactory;
 import org.opensearch.dataprepper.model.record.Record;
 import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecMetadataKeyAttributes;
 import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecTokenConfig;
@@ -64,6 +65,8 @@ import static org.mockito.Mockito.when;
 @ExtendWith(MockitoExtension.class)
 class SplunkHecServiceTest {
 
+    private static final EventFactory TEST_EVENT_FACTORY = TestEventFactory.getTestEventFactory();
+
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private String validToken;
@@ -80,9 +83,6 @@ class SplunkHecServiceTest {
 
     @Mock
     private AcknowledgementSetManager acknowledgementSetManager;
-
-    @Mock
-    private ServiceRequestContext serviceRequestContext;
 
     @Mock
     private Counter requestsReceivedCounter;
@@ -141,9 +141,9 @@ class SplunkHecServiceTest {
         when(config.getRawLineBreaker()).thenReturn("\n");
         when(config.getDefaultSourcetype()).thenReturn("httpevent");
         lenient().when(config.isWarnFutureTimestamps()).thenReturn(false);
-        lenient().when(config.getAckExpiry()).thenReturn(Duration.ofSeconds(300));
+        lenient().when(config.getAcknowledgementExpiry()).thenReturn(Duration.ofSeconds(300));
 
-        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        service = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
     }
 
     @Test
@@ -151,7 +151,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"test message\", \"host\": \"web01\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -164,7 +164,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"test message\"}";
         final AggregatedHttpRequest request = createRequest(body, null);
 
-        final AggregatedHttpResponse response = service.handleEvent(serviceRequestContext, request).aggregate().join();
+        final AggregatedHttpResponse response = service.handleEvent(request).aggregate().join();
         final Map<String, Object> responseBody = parseAggregated(response);
 
         assertThat(response.status(), equalTo(HttpStatus.UNAUTHORIZED));
@@ -177,7 +177,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"test message\"}";
         final AggregatedHttpRequest request = createRequest(body, "Splunk invalid-token");
 
-        final AggregatedHttpResponse response = service.handleEvent(serviceRequestContext, request).aggregate().join();
+        final AggregatedHttpResponse response = service.handleEvent(request).aggregate().join();
         final Map<String, Object> responseBody = parseAggregated(response);
 
         assertThat(response.status(), equalTo(HttpStatus.FORBIDDEN));
@@ -190,7 +190,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"test message\"}";
         final AggregatedHttpRequest request = createRequest(body, "Bearer " + validToken);
 
-        final AggregatedHttpResponse response = service.handleEvent(serviceRequestContext, request).aggregate().join();
+        final AggregatedHttpResponse response = service.handleEvent(request).aggregate().join();
         final Map<String, Object> responseBody = parseAggregated(response);
 
         assertThat(response.status(), equalTo(HttpStatus.UNAUTHORIZED));
@@ -209,12 +209,12 @@ class SplunkHecServiceTest {
         lenient().when(disabledSourceConfig.isFlattenEvent()).thenReturn(true);
         lenient().when(disabledSourceConfig.getRawLineBreaker()).thenReturn("\n");
         lenient().when(disabledSourceConfig.getDefaultSourcetype()).thenReturn("httpevent");
-        lenient().when(disabledSourceConfig.getAckExpiry()).thenReturn(Duration.ofSeconds(300));
+        lenient().when(disabledSourceConfig.getAcknowledgementExpiry()).thenReturn(Duration.ofSeconds(300));
         final SplunkHecService disabledService =
-                new SplunkHecService(8000, buffer, pluginMetrics, disabledSourceConfig, acknowledgementSetManager);
+                new SplunkHecService(8000, buffer, pluginMetrics, disabledSourceConfig, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final AggregatedHttpRequest request = createRequest("{\"event\": \"x\"}", "Splunk " + disabledToken);
-        final HttpResponse response = disabledService.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = disabledService.handleEvent(request);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.FORBIDDEN));
         verify(requestsAuthFailedCounter).increment();
@@ -225,7 +225,7 @@ class SplunkHecServiceTest {
         final String body = "{\"host\": \"web01\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(12));
@@ -238,7 +238,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"test message\", \"time\": \"not-a-number\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -250,7 +250,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"test message\", \"time\": \"1e309\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -262,7 +262,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"test message\", \"time\": 9300000000000000000}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -274,7 +274,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"first\"}{\"event\": \"second\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -286,7 +286,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": broken json}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(6));
@@ -298,7 +298,7 @@ class SplunkHecServiceTest {
     void handleEvent_with_empty_body_returns_no_data() throws Exception {
         final AggregatedHttpRequest request = createRequest("", authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(5));
@@ -310,7 +310,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"test\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.SERVICE_UNAVAILABLE));
         verify(bufferFullCounter).increment();
@@ -321,7 +321,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"msg\", \"host\": 123, \"source\": true, \"sourcetype\": 4.5, \"index\": 9}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -342,11 +342,11 @@ class SplunkHecServiceTest {
         when(tokenConfigWithDefaults.getDefaults()).thenReturn(defaults);
         when(config.getTokens()).thenReturn(List.of(tokenConfigWithDefaults));
 
-        final SplunkHecService svc = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        final SplunkHecService svc = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
         final String body = "{\"event\": \"msg\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        svc.handleEvent(serviceRequestContext, request);
+        svc.handleEvent(request);
 
         @SuppressWarnings("unchecked")
         final ArgumentCaptor<Collection<Record<Event>>> captor = ArgumentCaptor.forClass(Collection.class);
@@ -361,7 +361,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": {\"method\": \"GET\", \"path\": \"/api\"}}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        service.handleEvent(serviceRequestContext, request);
+        service.handleEvent(request);
 
         @SuppressWarnings("unchecked")
         final ArgumentCaptor<Collection<Record<Event>>> captor = ArgumentCaptor.forClass(Collection.class);
@@ -376,7 +376,7 @@ class SplunkHecServiceTest {
         final String body = "line1\nline2\nline3";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 "main", "syslog", "forwarder", "host1");
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -388,7 +388,7 @@ class SplunkHecServiceTest {
     void handleRaw_with_empty_body_returns_no_data() throws Exception {
         final AggregatedHttpRequest request = createRequest("", authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -399,7 +399,7 @@ class SplunkHecServiceTest {
     void handleRaw_with_missing_auth_returns_401() throws Exception {
         final AggregatedHttpRequest request = createRequest("line1\nline2", null);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.UNAUTHORIZED));
@@ -437,12 +437,12 @@ class SplunkHecServiceTest {
         lenient().when(pluginMetrics.gauge(eq("ackPending"), any(), any())).thenReturn(null);
 
         final SplunkHecService ackService = new SplunkHecService(8000, buffer, pluginMetrics,
-                config, acknowledgementSetManager);
+                config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final String body = "{\"event\": \"test\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = ackService.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = ackService.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(10));
@@ -464,12 +464,12 @@ class SplunkHecServiceTest {
                 .thenReturn(acknowledgementSet);
 
         final SplunkHecService ackService = new SplunkHecService(8000, buffer, pluginMetrics,
-                config, acknowledgementSetManager);
+                config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final String body = "{\"event\": \"test\"}";
         final AggregatedHttpRequest request = createRequestWithChannel(body, authHeader, "channel-123");
 
-        final HttpResponse response = ackService.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = ackService.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -481,7 +481,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"good\"}{\"host\": \"bad\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(12));
@@ -493,7 +493,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"msg\", \"time\": 1713196800.5}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -505,7 +505,7 @@ class SplunkHecServiceTest {
         final String body = "line1\n\n\nline2\n";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -527,11 +527,11 @@ class SplunkHecServiceTest {
         when(tokenConfigWithDefaults.getDefaults()).thenReturn(defaults);
         when(config.getTokens()).thenReturn(List.of(tokenConfigWithDefaults));
 
-        final SplunkHecService svc = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        final SplunkHecService svc = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
         final String body = "log line";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = svc.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = svc.handleRaw(request,
                 null, null, null, null);
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -552,13 +552,13 @@ class SplunkHecServiceTest {
         when(tokenConfigWithDefaults.getDefaults()).thenReturn(defaults);
         when(config.getTokens()).thenReturn(List.of(tokenConfigWithDefaults));
 
-        final SplunkHecService svc = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        final SplunkHecService svc = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
         final String body = "{\"event\": \"msg\", \"host\": \"explicit-host\", \"source\": \"explicit-src\", " +
                 "\"sourcetype\": \"explicit-st\", \"index\": \"explicit-idx\", " +
                 "\"fields\": {\"app\": \"myapp\"}}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = svc.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = svc.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -569,7 +569,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"no-time-event\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -581,7 +581,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"test\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.INTERNAL_SERVER_ERROR));
     }
@@ -592,7 +592,7 @@ class SplunkHecServiceTest {
         final String body = "some log line";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.INTERNAL_SERVER_ERROR));
@@ -604,7 +604,7 @@ class SplunkHecServiceTest {
         final String body = "some log line";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 null, null, null, null);
 
         assertThat(response.aggregate().join().status(), equalTo(HttpStatus.SERVICE_UNAVAILABLE));
@@ -615,7 +615,7 @@ class SplunkHecServiceTest {
         final String body = "log line";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 "my-index", "my-sourcetype", "my-source", "my-host");
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -627,7 +627,7 @@ class SplunkHecServiceTest {
         final String body = "log line";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleRaw(serviceRequestContext, request,
+        final HttpResponse response = service.handleRaw(request,
                 "  ", "  ", "  ", "  ");
         final Map<String, Object> responseBody = parseResponse(response);
 
@@ -639,7 +639,7 @@ class SplunkHecServiceTest {
         final String body = "{\"event\": \"msg\", \"host\": \"\", \"source\": \"\", \"sourcetype\": \"\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = service.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = service.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -648,12 +648,12 @@ class SplunkHecServiceTest {
     @Test
     void handleEvent_with_no_metadata_no_defaults() throws Exception {
         when(config.getDefaultSourcetype()).thenReturn(null);
-        final SplunkHecService svc = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager);
+        final SplunkHecService svc = new SplunkHecService(8000, buffer, pluginMetrics, config, acknowledgementSetManager, TEST_EVENT_FACTORY);
 
         final String body = "{\"event\": \"msg\"}";
         final AggregatedHttpRequest request = createRequest(body, authHeader);
 
-        final HttpResponse response = svc.handleEvent(serviceRequestContext, request);
+        final HttpResponse response = svc.handleEvent(request);
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(0));
@@ -667,6 +667,29 @@ class SplunkHecServiceTest {
         final Map<String, Object> responseBody = parseResponse(response);
 
         assertThat(responseBody.get("code"), equalTo(17));
+    }
+
+    @Test
+    void handleAck_without_auth_is_rejected_before_the_acknowledgements_disabled_check() throws Exception {
+        final AggregatedHttpRequest request = createRequest("{\"acks\": [0]}", null);
+
+        final AggregatedHttpResponse response = service.handleAck(request).aggregate().join();
+        final Map<String, Object> responseBody = parseAggregated(response);
+
+        assertThat(response.status(), equalTo(HttpStatus.UNAUTHORIZED));
+        assertThat(responseBody.get("code"), equalTo(2));
+        verify(requestsAuthFailedCounter).increment();
+    }
+
+    @Test
+    void handleAck_with_auth_and_acknowledgements_disabled_returns_ack_disabled() throws Exception {
+        final AggregatedHttpRequest request = createRequest("{\"acks\": [0]}", authHeader);
+
+        final AggregatedHttpResponse response = service.handleAck(request).aggregate().join();
+        final Map<String, Object> responseBody = parseAggregated(response);
+
+        assertThat(response.status(), equalTo(HttpStatus.BAD_REQUEST));
+        assertThat(responseBody.get("code"), equalTo(14));
     }
 
     private AggregatedHttpRequest createRequest(final String body, final String authHeader) {

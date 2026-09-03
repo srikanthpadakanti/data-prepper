@@ -15,6 +15,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
+import org.opensearch.dataprepper.armeria.authentication.ArmeriaHttpAuthenticationProvider;
 import org.opensearch.dataprepper.http.BaseHttpServerConfig;
 import org.opensearch.dataprepper.plugins.source.splunkhec.model.HecTokenConfig;
 
@@ -28,7 +29,8 @@ public class SplunkHecSourceConfig extends BaseHttpServerConfig {
     static final String DEFAULT_PATH_PREFIX = "/services/collector";
     static final String DEFAULT_SOURCETYPE = "httpevent";
     static final String DEFAULT_RAW_LINE_BREAKER = "\n";
-    static final Duration DEFAULT_ACK_EXPIRY = Duration.ofSeconds(300);
+    static final Duration DEFAULT_ACKNOWLEDGEMENT_EXPIRY = Duration.ofSeconds(300);
+    static final boolean DEFAULT_SSL = true;
 
     @JsonProperty("tokens")
     @JsonPropertyDescription("The list of HEC tokens accepted on the Authorization: Splunk header. " +
@@ -50,7 +52,9 @@ public class SplunkHecSourceConfig extends BaseHttpServerConfig {
 
     @JsonProperty("default_sourcetype")
     @JsonPropertyDescription("The sourcetype applied to events when neither the request nor the token defaults specify one. " +
+            "Splunk sourcetypes are defined by each Splunk deployment and are not drawn from a fixed set, so any value is accepted. " +
             "Defaults to httpevent.")
+    @NotEmpty(message = "default_sourcetype must not be empty")
     private String defaultSourcetype = DEFAULT_SOURCETYPE;
 
     @JsonProperty("warn_future_timestamps")
@@ -63,16 +67,11 @@ public class SplunkHecSourceConfig extends BaseHttpServerConfig {
             "Defaults to false.")
     private boolean acknowledgements;
 
-    @JsonProperty("ack_expiry")
+    @JsonProperty("acknowledgement_expiry")
     @JsonPropertyDescription("How long acknowledgement state is retained before it is eligible for cleanup. " +
             "Defaults to 300 seconds.")
-    @NotNull(message = "ack_expiry must not be null")
-    private Duration ackExpiry = DEFAULT_ACK_EXPIRY;
-
-    @JsonProperty("use_forwarded_headers")
-    @JsonPropertyDescription("When true, trusts X-Forwarded-For for client IP logging behind a load balancer. " +
-            "Defaults to false.")
-    private boolean useForwardedHeaders;
+    @NotNull(message = "acknowledgement_expiry must not be null")
+    private Duration acknowledgementExpiry = DEFAULT_ACKNOWLEDGEMENT_EXPIRY;
 
     public List<HecTokenConfig> getTokens() {
         if (tokens == null) {
@@ -101,12 +100,8 @@ public class SplunkHecSourceConfig extends BaseHttpServerConfig {
         return acknowledgements;
     }
 
-    public Duration getAckExpiry() {
-        return ackExpiry;
-    }
-
-    public boolean isUseForwardedHeaders() {
-        return useForwardedHeaders;
+    public Duration getAcknowledgementExpiry() {
+        return acknowledgementExpiry;
     }
 
     @AssertTrue(message = "tokens must not contain null or blank token values")
@@ -115,9 +110,17 @@ public class SplunkHecSourceConfig extends BaseHttpServerConfig {
                 && tokens.stream().allMatch(t -> t != null && t.getToken() != null && !t.getToken().isBlank());
     }
 
-    @AssertTrue(message = "ack_expiry must be positive")
-    boolean isAckExpiryPositive() {
-        return ackExpiry == null || (!ackExpiry.isNegative() && !ackExpiry.isZero());
+    @AssertTrue(message = "acknowledgement_expiry must be positive")
+    boolean isAcknowledgementExpiryPositive() {
+        return acknowledgementExpiry == null
+                || (!acknowledgementExpiry.isNegative() && !acknowledgementExpiry.isZero());
+    }
+
+    @AssertTrue(message = "authentication must not be configured for the splunk_hec source; " +
+            "the Splunk HEC protocol authenticates with the tokens option instead")
+    boolean isAuthenticationAbsent() {
+        return getAuthentication() == null
+                || ArmeriaHttpAuthenticationProvider.UNAUTHENTICATED_PLUGIN_NAME.equals(getAuthentication().getPluginName());
     }
 
     @Override
@@ -128,6 +131,11 @@ public class SplunkHecSourceConfig extends BaseHttpServerConfig {
     @Override
     public String getDefaultPath() {
         return DEFAULT_PATH_PREFIX;
+    }
+
+    @Override
+    public boolean getDefaultSsl() {
+        return DEFAULT_SSL;
     }
 
     @Override
