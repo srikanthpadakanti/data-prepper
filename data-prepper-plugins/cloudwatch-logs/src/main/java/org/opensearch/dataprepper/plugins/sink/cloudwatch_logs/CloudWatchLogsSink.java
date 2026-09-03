@@ -6,6 +6,7 @@
 package org.opensearch.dataprepper.plugins.sink.cloudwatch_logs;
 
 import org.opensearch.dataprepper.aws.api.AwsCredentialsSupplier;
+import org.opensearch.dataprepper.expression.ExpressionEvaluator;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPlugin;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPluginConstructor;
@@ -22,6 +23,7 @@ import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.client.CloudWatch
 import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.client.CloudWatchLogsMetrics;
 import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.client.CloudWatchLogsService;
 import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.client.CloudWatchLogsClientFactory;
+import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.client.EntityResolver;
 import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.config.AwsConfig;
 import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.config.CloudWatchLogsSinkConfig;
 import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.config.EntityConfig;
@@ -29,6 +31,7 @@ import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.config.EntityConf
 import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.config.ThresholdConfig;
 import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.exception.InvalidBufferTypeException;
 import org.opensearch.dataprepper.plugins.sink.cloudwatch_logs.utils.CloudWatchLogsLimits;
+import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudwatchlogs.CloudWatchLogsClient;
 import software.amazon.awssdk.services.cloudwatchlogs.model.Entity;
 import org.opensearch.dataprepper.plugins.dlq.DlqPushHandler;
@@ -46,6 +49,7 @@ import java.util.concurrent.Executors;
 public class CloudWatchLogsSink extends AbstractSink<Record<Event>> {
     private static final Logger LOG = LoggerFactory.getLogger(CloudWatchLogsSink.class);
 
+    // Also keeps the cardinality gauge's weak reference to the service from being collected.
     private final CloudWatchLogsService cloudWatchLogsService;
     private DlqPushHandler dlqPushHandler = null;
     private volatile boolean isInitialized;
@@ -55,7 +59,8 @@ public class CloudWatchLogsSink extends AbstractSink<Record<Event>> {
                               final PluginMetrics pluginMetrics,
                               final PluginFactory pluginFactory,
                               final CloudWatchLogsSinkConfig cloudWatchLogsSinkConfig,
-                              final AwsCredentialsSupplier awsCredentialsSupplier) {
+                              final AwsCredentialsSupplier awsCredentialsSupplier,
+                              final ExpressionEvaluator expressionEvaluator) {
         super(pluginSetting);
 
         AwsConfig awsConfig = cloudWatchLogsSinkConfig.getAwsConfig();
@@ -82,18 +87,40 @@ public class CloudWatchLogsSink extends AbstractSink<Record<Event>> {
         bufferFactory = new InMemoryBufferFactory();
 
         if (cloudWatchLogsSinkConfig.getDlq() != null) {
-            String region = awsConfig.getAwsRegion().toString();
-            String role = awsConfig.getAwsStsRoleArn();
+            String region = null;
+            if (awsConfig != null && awsConfig.getAwsRegion() != null) {
+                region = awsConfig.getAwsRegion().toString();
+            } else if (awsCredentialsSupplier != null) {
+                region = awsCredentialsSupplier.getDefaultRegion()
+                        .map(Region::toString)
+                        .orElse(null);
+            }
+            String role = null;
+            if (awsConfig != null && awsConfig.getAwsStsRoleArn() != null) {
+                role = awsConfig.getAwsStsRoleArn();
+            } else if (awsCredentialsSupplier != null) {
+                role = awsCredentialsSupplier.getDefaultStsRoleArn()
+                        .orElse(null);
+            }
             dlqPushHandler = new DlqPushHandler(pluginFactory, pluginSetting, pluginMetrics, cloudWatchLogsSinkConfig.getDlq(), region, role, "cloudWatchLogs");
         }
 
         Executor executor = Executors.newFixedThreadPool(cloudWatchLogsSinkConfig.getWorkers());
 
         final EntityConfig entityConfig = cloudWatchLogsSinkConfig.getEntityConfig();
-        final Entity entity = entityConfig == null ? null : Entity.builder()
+        final boolean dynamicEntity = entityConfig != null && entityConfig.isDynamic(expressionEvaluator);
+
+        final Entity staticEntity = (entityConfig == null || dynamicEntity) ? null : Entity.builder()
                 .keyAttributes(entityConfig.getKeyAttributes())
                 .attributes(entityConfig.getAttributes())
                 .build();
+
+        // The same evaluator that classified this config as dynamic has to do the interpolating, or
+        // expression-valued attributes would resolve to an empty string instead of being evaluated.
+        final EntityResolver entityResolver = dynamicEntity
+                ? new EntityResolver(entityConfig.getKeyAttributes(), entityConfig.getAttributes(),
+                        expressionEvaluator)
+                : null;
 
         CloudWatchLogsDispatcher cloudWatchLogsDispatcher = CloudWatchLogsDispatcher.builder()
                 .cloudWatchLogsClient(cloudWatchLogsClient)
@@ -106,17 +133,27 @@ public class CloudWatchLogsSink extends AbstractSink<Record<Event>> {
                 .executor(executor)
                 .createLogGroup(cloudWatchLogsSinkConfig.getCreateLogGroup())
                 .createLogStream(cloudWatchLogsSinkConfig.getCreateLogStream())
-                .entity(entity)
+                .entity(staticEntity)
                 .build();
 
-        Buffer buffer;
-        try {
-            buffer = bufferFactory.getBuffer();
-        } catch (NullPointerException e) {
-            throw new InvalidBufferTypeException("Error loading buffer!");
+        if (dynamicEntity) {
+            cloudWatchLogsService = new CloudWatchLogsService(bufferFactory, cloudWatchLogsMetrics, cloudWatchLogsLimits,
+                    cloudWatchLogsDispatcher, dlqPushHandler, true, entityResolver,
+                    entityConfig.getMaxCardinality());
+            // Gauged on the service: the group count is the number of entities actually being buffered
+            // right now, and it falls again as groups go idle rather than only ever climbing.
+            cloudWatchLogsMetrics.registerEntityCardinalityGauge(cloudWatchLogsService,
+                    CloudWatchLogsService::activeEntityGroupCount);
+        } else {
+            Buffer buffer;
+            try {
+                buffer = bufferFactory.getBuffer();
+            } catch (NullPointerException e) {
+                throw new InvalidBufferTypeException("Error loading buffer!");
+            }
+            cloudWatchLogsService = new CloudWatchLogsService(buffer, cloudWatchLogsMetrics, cloudWatchLogsLimits,
+                    cloudWatchLogsDispatcher, dlqPushHandler, true);
         }
-
-        cloudWatchLogsService = new CloudWatchLogsService(buffer, cloudWatchLogsMetrics, cloudWatchLogsLimits, cloudWatchLogsDispatcher, dlqPushHandler, true);
     }
 
     @Override
