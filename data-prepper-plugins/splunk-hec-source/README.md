@@ -45,7 +45,7 @@ Each request must carry `Authorization: Splunk <token>`. A missing header return
 
 ## Event Schema
 
-Each HEC event becomes a Data Prepper event. A string `event` becomes a `message` field; a JSON object `event` is flattened to top-level fields when `flatten_event` is true (default) or nested otherwise. `host`, `source`, `sourcetype` become fields, `index` becomes routing metadata, `fields` are merged, and `time` becomes `@timestamp` (falling back to the current time when absent or unparseable).
+Each HEC event becomes a Data Prepper event, built by `HecEventBuilder` through the injected `EventFactory`. A string `event` becomes a `message` field; a JSON object `event` is flattened to top-level fields when `flatten_event` is true (default) or nested otherwise. `host`, `source`, `sourcetype` become fields, `index` becomes routing metadata, `fields` are merged, and `time` becomes `@timestamp` (falling back to the current time when absent or unparseable). The `/raw` endpoint resolves the same metadata from its query parameters and the per-token defaults, so both endpoints attach the same routing metadata.
 
 ## Configuration Options
 
@@ -57,12 +57,12 @@ Top level:
 * `tokens` (Required): non-empty list of accepted HEC tokens; each may set `enabled` and per-token `defaults` (`index`, `sourcetype`, `source`, `host`, `fields`).
 * `flatten_event` (Optional): flatten JSON object events into top-level fields. Default `true`.
 * `raw_line_breaker` (Optional): literal delimiter for the raw endpoint. Default newline.
-* `default_sourcetype` (Optional): sourcetype when unspecified. Default `httpevent`.
+* `default_sourcetype` (Optional): sourcetype when unspecified. Default `httpevent`. This is a free-form string because Splunk sourcetypes are defined by each Splunk deployment and are not drawn from a fixed set.
 * `acknowledgements` (Optional): enable the HEC indexer ack protocol. Default `false`.
-* `ack_expiry` (Optional): retention for ack state. Default `300s`.
+* `acknowledgement_expiry` (Optional): retention for ack state. Default `300s`.
 * `warn_future_timestamps` (Optional): warn on timestamps more than one hour in the future. Default `false`.
-* `use_forwarded_headers` (Optional): trust `X-Forwarded-For` for client IP logging. Default `false`.
-* SSL/TLS options (`ssl`, `ssl_certificate_file`, `ssl_key_file`, and related) are inherited from the common HTTP server configuration.
+* SSL/TLS options (`ssl`, `ssl_certificate_file`, `ssl_key_file`, and related) are inherited from the common HTTP server configuration. Unlike the other HTTP sources, `ssl` defaults to `true` for this source, so `ssl_certificate_file` and `ssl_key_file` are required unless you set `ssl: false`.
+* `authentication` (Not supported): the Splunk HEC protocol authenticates with the `Authorization: Splunk <token>` header, which this source validates through the `tokens` option. Configuring the shared `authentication` plugin is rejected so that there is only one authentication mechanism in effect.
 
 ## Backpressure
 
