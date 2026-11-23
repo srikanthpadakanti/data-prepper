@@ -147,6 +147,11 @@ class OTelTraceRawProcessorTest {
     }
 
     @Test
+    void holdsEvents_returns_true() {
+        assertThat(oTelTraceRawProcessor.holdsEvents(), equalTo(true));
+    }
+
+    @Test
     void testEmptyCollection() {
         assertThat(oTelTraceRawProcessor.doExecute(Collections.EMPTY_LIST)).isEmpty();
     }

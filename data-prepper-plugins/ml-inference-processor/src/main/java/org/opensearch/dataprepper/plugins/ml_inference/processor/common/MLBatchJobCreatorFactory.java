@@ -14,22 +14,16 @@ import org.opensearch.dataprepper.plugins.ml_inference.processor.dlq.DlqPushHand
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class MLBatchJobCreatorFactory {
     private static final Logger LOG = LoggerFactory.getLogger(MLProcessor.class);
 
-    // A thread-safe map to store singleton instances of each service
-    private static final Map<ServiceName, MLBatchJobCreator> jobCreators = new ConcurrentHashMap<>();
-
     public static MLBatchJobCreator getJobCreator(final ServiceName serviceName, final MLProcessorConfig mlProcessorConfig,
                                                   final AwsCredentialsSupplier awsCredentialsSupplier, final PluginMetrics pluginMetrics, final DlqPushHandler dlqPushHandler) {
-        // If the instance for the given service name is already created, return it
         if (serviceName == null) {
             throw new IllegalArgumentException("ServiceName cannot be null");
         }
-        return jobCreators.computeIfAbsent(serviceName, key -> createJobCreator(key, mlProcessorConfig, awsCredentialsSupplier, pluginMetrics, dlqPushHandler));
+        return createJobCreator(serviceName, mlProcessorConfig, awsCredentialsSupplier, pluginMetrics, dlqPushHandler);
     }
 
     private static MLBatchJobCreator createJobCreator(final ServiceName serviceName, final MLProcessorConfig mlProcessorConfig,

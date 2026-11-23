@@ -135,6 +135,9 @@ public class SageMakerBatchJobCreator extends AbstractBatchJobCreator {
             if (batch_records.size() >= maxBatchSize) {
                 shouldProcess = true;
                 LOG.info("Processing batch due to size limit reached: {}", batch_records.size());
+            } else if (shuttingDown) {
+                shouldProcess = true;
+                LOG.info("Processing batch of {} records for shutdown", batch_records.size());
             } else if (lastUpdate != -1 &&
                     currentTime - lastUpdate >= INACTIVITY_TIMEOUT_MS) {
                 shouldProcess = true;
@@ -143,8 +146,11 @@ public class SageMakerBatchJobCreator extends AbstractBatchJobCreator {
             }
 
             if (shouldProcess) {
-                List<Record<Event>> currentBatch = new ArrayList<>(batch_records);
-                batch_records.clear();
+                final List<Record<Event>> currentBatch = new ArrayList<>();
+                Record<Event> batchRecord;
+                while ((batchRecord = batch_records.poll()) != null) {
+                    currentBatch.add(batchRecord);
+                }
                 lastUpdateTimestamp.set(-1);
                 // Reset the flag when we process the batch
                 retryRecordsAddedToBatch = false;
@@ -238,6 +244,12 @@ public class SageMakerBatchJobCreator extends AbstractBatchJobCreator {
     }
 
     private void handleThrottling(List<Record<Event>> currentBatch) {
+        if (shuttingDown) {
+            LOG.warn("Throttled while shutting down. Failing {} records instead of retrying", currentBatch.size());
+            handleFailure(currentBatch, processedBatchRecords,
+                    new MLBatchJobException(TOO_MANY_REQUESTS, "Throttled while shutting down"), TOO_MANY_REQUESTS);
+            return;
+        }
         LOG.warn("Rate limited (429). Adding {} records to retry queue", currentBatch.size());
 
         // Create a set of records already in retry queue
@@ -338,12 +350,8 @@ public class SageMakerBatchJobCreator extends AbstractBatchJobCreator {
 
     // Shutdown methods
     @Override
-    public void prepareForShutdown() {
-    }
-
-    @Override
     public boolean isReadyForShutdown() {
-        return batch_records.isEmpty();
+        return batch_records.isEmpty() && processedBatchRecords.isEmpty() && retryQueue.isEmpty();
     }
 
     @Override

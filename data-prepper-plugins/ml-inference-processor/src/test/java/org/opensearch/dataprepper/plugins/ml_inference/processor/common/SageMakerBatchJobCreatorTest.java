@@ -53,6 +53,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.hamcrest.Matchers.matchesPattern;
@@ -916,6 +919,117 @@ public class SageMakerBatchJobCreatorTest {
             return (Record<Event>) recordField.get(retryRecord);
         } catch (Exception e) {
             throw new RuntimeException("Failed to get record from RetryRecord", e);
+        }
+    }
+
+    @Test
+    void isReadyForShutdown_with_processed_records_waiting_to_be_emitted_returns_false() {
+        processedBatchRecords.add(new Record<>(createMockEvent("test-bucket", "input.jsonl")));
+
+        assertThat(sageMakerBatchJobCreator.isReadyForShutdown(), equalTo(false));
+    }
+
+    @Test
+    void isReadyForShutdown_with_records_in_retry_queue_returns_false() {
+        batch_records.add(new Record<>(createMockEvent("test-bucket", "input.jsonl")));
+
+        try (MockedStatic<RetryUtil> mockedRetryUtil = mockStatic(RetryUtil.class)) {
+            mockedRetryUtil.when(() -> RetryUtil.retryWithBackoffWithResult(any(), any()))
+                    .thenReturn(new RetryUtil.RetryResult(false, new MLBatchJobException(429, "Rate limited"), 1));
+
+            sageMakerBatchJobCreator.checkAndProcessBatch();
+        }
+
+        assertThat(sageMakerBatchJobCreator.getRetryQueue().size(), equalTo(1));
+        assertThat(sageMakerBatchJobCreator.isReadyForShutdown(), equalTo(false));
+    }
+
+    @Test
+    void checkAndProcessBatch_after_prepareForShutdown_processes_batch_below_max_size() {
+        final SageMakerBatchJobCreator creator = createCreatorWithMaxBatchSize(100);
+        final Record<Event> record = new Record<>(createMockEvent("test-bucket", "input.jsonl"));
+        creator.createMLBatchJob(Collections.singletonList(record), new ArrayList<>());
+
+        try (MockedStatic<RetryUtil> mockedRetryUtil = mockStatic(RetryUtil.class)) {
+            mockedRetryUtil.when(() -> RetryUtil.retryWithBackoffWithResult(any(), any()))
+                    .thenReturn(new RetryUtil.RetryResult(true, null, 1));
+
+            creator.prepareForShutdown();
+            creator.checkAndProcessBatch();
+        }
+
+        assertThat(creator.getBatch_records(), empty());
+        assertThat(creator.getProcessedBatchRecords(), contains(record));
+    }
+
+    @Test
+    void checkAndProcessBatch_without_prepareForShutdown_keeps_batch_below_max_size() {
+        final SageMakerBatchJobCreator creator = createCreatorWithMaxBatchSize(100);
+        final Record<Event> record = new Record<>(createMockEvent("test-bucket", "input.jsonl"));
+        creator.createMLBatchJob(Collections.singletonList(record), new ArrayList<>());
+
+        creator.checkAndProcessBatch();
+
+        assertThat(creator.getBatch_records(), contains(record));
+        assertThat(creator.getProcessedBatchRecords(), empty());
+    }
+
+    @Test
+    void checkAndProcessBatch_throttled_after_prepareForShutdown_emits_records_as_failed() {
+        final Record<Event> record = new Record<>(createMockEvent("test-bucket", "input.jsonl"));
+        batch_records.add(record);
+
+        try (MockedStatic<RetryUtil> mockedRetryUtil = mockStatic(RetryUtil.class)) {
+            mockedRetryUtil.when(() -> RetryUtil.retryWithBackoffWithResult(any(), any()))
+                    .thenReturn(new RetryUtil.RetryResult(false, new MLBatchJobException(429, "Rate limited"), 1));
+
+            sageMakerBatchJobCreator.prepareForShutdown();
+            sageMakerBatchJobCreator.checkAndProcessBatch();
+        }
+
+        assertThat(sageMakerBatchJobCreator.getRetryQueue(), empty());
+        assertThat(processedBatchRecords, contains(record));
+        verify(recordsFailedCounter).increment(1);
+    }
+
+    @Test
+    void checkAndProcessBatch_after_prepareForShutdown_fails_records_from_retry_queue_when_throttled_again() {
+        final Record<Event> record = new Record<>(createMockEvent("test-bucket", "input.jsonl"));
+        batch_records.add(record);
+
+        try (MockedStatic<RetryUtil> mockedRetryUtil = mockStatic(RetryUtil.class)) {
+            mockedRetryUtil.when(() -> RetryUtil.retryWithBackoffWithResult(any(), any()))
+                    .thenReturn(new RetryUtil.RetryResult(false, new MLBatchJobException(429, "Rate limited"), 1));
+
+            sageMakerBatchJobCreator.checkAndProcessBatch();
+            assertThat(sageMakerBatchJobCreator.getRetryQueue().size(), equalTo(1));
+
+            sageMakerBatchJobCreator.prepareForShutdown();
+            sageMakerBatchJobCreator.checkAndProcessBatch();
+        }
+
+        assertThat(sageMakerBatchJobCreator.getRetryQueue(), empty());
+        assertThat(processedBatchRecords, contains(record));
+    }
+
+    @Test
+    void isReadyForShutdown_after_records_are_emitted_returns_true() {
+        final List<Record<Event>> resultRecords = new ArrayList<>();
+        final Record<Event> record = new Record<>(createMockEvent("test-bucket", "input.jsonl"));
+        processedBatchRecords.add(record);
+
+        sageMakerBatchJobCreator.addProcessedBatchRecordsToResults(resultRecords);
+
+        assertThat(resultRecords, contains(record));
+        assertThat(sageMakerBatchJobCreator.isReadyForShutdown(), equalTo(true));
+    }
+
+    private SageMakerBatchJobCreator createCreatorWithMaxBatchSize(final int maxBatchSize) {
+        when(mlProcessorConfig.getMaxBatchSize()).thenReturn(maxBatchSize);
+        try (MockedStatic<S3ClientFactory> mockedS3ClientFactory = mockStatic(S3ClientFactory.class)) {
+            mockedS3ClientFactory.when(() -> S3ClientFactory.createS3Client(mlProcessorConfig, awsCredentialsSupplier))
+                    .thenReturn(s3Client);
+            return new SageMakerBatchJobCreator(mlProcessorConfig, awsCredentialsSupplier, pluginMetrics, dlqPushHandler);
         }
     }
 }

@@ -15,6 +15,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.dataprepper.core.peerforwarder.exception.EmptyPeerForwarderPluginIdentificationKeysException;
@@ -415,6 +417,16 @@ class PeerForwardingProcessingDecoratorTest {
             assertThat(processors.size(), equalTo(1));
             processors.get(0).isReadyForShutdown();
             verify(processor).isReadyForShutdown();
+        }
+
+        @ParameterizedTest
+        @ValueSource(booleans = {true, false})
+        void PeerForwardingProcessingDecorator_holdsEvents_returns_inner_processors_holdsEvents(final boolean innerHoldsEvents) {
+            when(processor.holdsEvents()).thenReturn(innerHoldsEvents);
+            final List<Processor> processors = createObjectUnderTestDecoratedProcessors(Collections.singletonList(processor));
+
+            assertThat(processors.size(), equalTo(1));
+            assertThat(processors.get(0).holdsEvents(), equalTo(innerHoldsEvents));
         }
 
         @Test

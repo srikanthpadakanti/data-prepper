@@ -140,6 +140,11 @@ public class PeerForwardingProcessorDecorator implements Processor<Record<Event>
     }
 
     @Override
+    public boolean holdsEvents() {
+        return innerProcessor.holdsEvents();
+    }
+
+    @Override
     public void shutdown() {
         innerProcessor.shutdown();
     }

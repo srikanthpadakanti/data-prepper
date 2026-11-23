@@ -42,6 +42,7 @@ public abstract class AbstractBatchJobCreator implements MLBatchJobCreator {
     protected final MlCommonRequester mlCommonRequester;
     protected DlqPushHandler dlqPushHandler = null;
     protected final long maxRetryTimeWindow;
+    protected volatile boolean shuttingDown = false;
     private static final Aws4Signer signer;
     static {
         signer = Aws4Signer.create();
@@ -71,6 +72,11 @@ public abstract class AbstractBatchJobCreator implements MLBatchJobCreator {
 
     public void incrementFailureCounter() {
         numberOfBatchJobsFailedCounter.increment();
+    }
+
+    @Override
+    public void prepareForShutdown() {
+        shuttingDown = true;
     }
 
     // Abstract methods for batch job creation, specific to the implementations

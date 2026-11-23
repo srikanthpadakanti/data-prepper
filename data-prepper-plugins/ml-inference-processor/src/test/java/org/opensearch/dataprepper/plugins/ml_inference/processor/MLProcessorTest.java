@@ -32,6 +32,8 @@ import java.util.Collections;
 import java.util.List;
 
 
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -173,5 +175,10 @@ public class MLProcessorTest {
         verify(mlBatchJobCreator).prepareForShutdown();
         verify(mlBatchJobCreator).shutdown();
 
+    }
+
+    @Test
+    void holdsEvents_returns_true() {
+        assertThat(mlProcessor.holdsEvents(), equalTo(true));
     }
 }

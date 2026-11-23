@@ -23,20 +23,28 @@ import org.opensearch.dataprepper.plugins.ml_inference.processor.exception.MLBat
 
 import java.lang.reflect.Field;
 import java.time.Duration;
+import java.util.Collections;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.UUID;
 
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.opensearch.dataprepper.plugins.ml_inference.processor.MLProcessorConfig.DEFAULT_RETRY_INTERVAL_SECONDS;
 import static org.opensearch.dataprepper.plugins.ml_inference.processor.MLProcessorConfig.DEFAULT_RETRY_WINDOW;
@@ -378,5 +386,78 @@ public class BedrockBatchJobCreatorTest {
         final Field field = BedrockBatchJobCreator.class.getDeclaredField("batchPredictor");
         field.setAccessible(true);
         field.set(creator, predictor);
+    }
+
+    @Test
+    void isReadyForShutdown_with_throttled_records_returns_false() {
+        createThrottledRecord(Duration.ofSeconds(60));
+
+        assertThat(bedrockBatchJobCreator.getThrottledRecords().size(), equalTo(1));
+        assertThat(bedrockBatchJobCreator.isReadyForShutdown(), equalTo(false));
+    }
+
+    @Test
+    void addProcessedBatchRecordsToResults_after_prepareForShutdown_emits_throttled_records_without_waiting_for_retry_interval()
+            throws Exception {
+        final Record<Event> record = createThrottledRecord(Duration.ofSeconds(60));
+        final List<Record<Event>> resultRecords = new ArrayList<>();
+        final BatchPredictor batchPredictor = mock(BatchPredictor.class);
+        injectBatchPredictor(bedrockBatchJobCreator, batchPredictor);
+
+        bedrockBatchJobCreator.prepareForShutdown();
+        bedrockBatchJobCreator.addProcessedBatchRecordsToResults(resultRecords);
+
+        assertThat(resultRecords, contains(record));
+        assertThat(bedrockBatchJobCreator.getThrottledRecords(), empty());
+        assertThat(bedrockBatchJobCreator.isReadyForShutdown(), equalTo(true));
+        verifyNoInteractions(batchPredictor);
+    }
+
+    @Test
+    void addProcessedBatchRecordsToResults_without_prepareForShutdown_keeps_throttled_records_until_retry_interval() {
+        final Record<Event> record = createThrottledRecord(Duration.ofSeconds(60));
+        final List<Record<Event>> resultRecords = new ArrayList<>();
+
+        bedrockBatchJobCreator.addProcessedBatchRecordsToResults(resultRecords);
+
+        assertThat(resultRecords, empty());
+        assertThat(bedrockBatchJobCreator.getThrottledRecords().size(), equalTo(1));
+    }
+
+    @Test
+    void createMLBatchJob_with_failed_record_and_no_dlq_counts_the_failed_record() throws Exception {
+        final Counter failedRecordsCounter = mock(Counter.class);
+        when(pluginMetrics.counter(NUMBER_OF_RECORDS_FAILED_IN_BATCH_JOB)).thenReturn(failedRecordsCounter);
+        final BedrockBatchJobCreator creator = new BedrockBatchJobCreator(mlProcessorConfig, awsCredentialsSupplier, pluginMetrics, null);
+        final BatchPredictor batchPredictor = mock(BatchPredictor.class);
+        when(batchPredictor.predict(anyString()))
+                .thenReturn(new RetryUtil.RetryResult(false, new MLBatchJobException(500, UUID.randomUUID().toString()), 1));
+        injectBatchPredictor(creator, batchPredictor);
+        final Event event = mock(Event.class);
+        when(event.getJsonNode()).thenReturn(OBJECT_MAPPER.createObjectNode()
+                .put("bucket", UUID.randomUUID().toString())
+                .put("key", UUID.randomUUID().toString()));
+        final List<Record<Event>> resultRecords = new ArrayList<>();
+
+        assertThrows(MLBatchJobException.class,
+                () -> creator.createMLBatchJob(Collections.singletonList(new Record<>(event)), resultRecords));
+
+        verify(failedRecordsCounter).increment(1);
+    }
+
+    private Record<Event> createThrottledRecord(final Duration retryInterval) {
+        when(mlProcessorConfig.getRetryInterval()).thenReturn(retryInterval);
+        bedrockBatchJobCreator = spy(new BedrockBatchJobCreator(mlProcessorConfig, awsCredentialsSupplier, pluginMetrics, dlqPushHandler));
+        final Event event = mock(Event.class);
+        when(event.getJsonNode()).thenReturn(OBJECT_MAPPER.createObjectNode()
+                .put("bucket", "test-bucket")
+                .put("key", "input.jsonl"));
+        final Record<Event> record = new Record<>(event);
+        try (MockedStatic<RetryUtil> mockedStatic = mockStatic(RetryUtil.class)) {
+            mockedStatic.when(() -> RetryUtil.retryWithBackoffWithResult(any(Runnable.class), any()))
+                    .thenReturn(new RetryUtil.RetryResult(false, new MLBatchJobException(429, "throttled"), 1));
+            bedrockBatchJobCreator.createMLBatchJob(Collections.singletonList(record), new ArrayList<>());
+        }
+        return record;
     }
 }

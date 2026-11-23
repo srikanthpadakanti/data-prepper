@@ -132,6 +132,11 @@ public class MLProcessor extends AbstractProcessor<Record<Event>, Record<Event>>
     }
 
     @Override
+    public boolean holdsEvents() {
+        return true;
+    }
+
+    @Override
     public void shutdown() {
         mlBatchJobCreator.shutdown();
     }

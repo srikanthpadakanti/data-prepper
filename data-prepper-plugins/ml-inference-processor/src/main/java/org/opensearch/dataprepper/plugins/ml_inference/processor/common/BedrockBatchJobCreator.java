@@ -78,7 +78,7 @@ public class BedrockBatchJobCreator extends AbstractBatchJobCreator {
 
         if (!failedRecords.isEmpty()) {
             pushToDlq(dlqObjects);
-            numberOfRecordsFailedCounter.increment(dlqObjects.size());
+            numberOfRecordsFailedCounter.increment(failedRecords.size());
 
             throw new MLBatchJobException(
                     String.format("Failed to process %d records out of %d total records",
@@ -155,7 +155,7 @@ public class BedrockBatchJobCreator extends AbstractBatchJobCreator {
         long currentTime = System.currentTimeMillis();
         long timeSinceLastRetry = currentTime - lastRetryTimestamp;
 
-        if (timeSinceLastRetry < retryIntervalMillis) {
+        if (!shuttingDown && timeSinceLastRetry < retryIntervalMillis) {
             LOG.debug("Skipping retry processing. Only {}ms passed since last retry (need {}ms)",
                     timeSinceLastRetry, retryIntervalMillis);
             return;
@@ -255,7 +255,11 @@ public class BedrockBatchJobCreator extends AbstractBatchJobCreator {
         }
 
         handleExpiredRecords(expiredRecords, resultRecords);
-        retryThrottledRecords(recordsToRetry, resultRecords);
+        if (shuttingDown) {
+            failThrottledRecordsAtShutdown(recordsToRetry, resultRecords);
+        } else {
+            retryThrottledRecords(recordsToRetry, resultRecords);
+        }
     }
 
     private void retryThrottledRecords(List<RetryRecord> recordsToRetry, List<Record<Event>> resultRecords) {
@@ -271,6 +275,30 @@ public class BedrockBatchJobCreator extends AbstractBatchJobCreator {
                 resultRecords,
                 recordsToRetry
         );
+    }
+
+    private void failThrottledRecordsAtShutdown(final List<RetryRecord> throttledAtShutdown, final List<Record<Event>> resultRecords) {
+        if (throttledAtShutdown.isEmpty()) {
+            return;
+        }
+
+        LOG.warn("Throttled while shutting down. Failing {} records instead of retrying", throttledAtShutdown.size());
+
+        final List<Record<Event>> failedRecords = new ArrayList<>();
+        final List<DlqObject> dlqObjects = new ArrayList<>();
+        final MLBatchJobException throttledAtShutdownException = new MLBatchJobException(TOO_MANY_REQUESTS, "Throttled while shutting down");
+        for (final RetryRecord retryRecord : throttledAtShutdown) {
+            handleFailure(
+                    retryRecord.getRecord(),
+                    resultRecords,
+                    failedRecords,
+                    dlqObjects,
+                    throttledAtShutdownException,
+                    TOO_MANY_REQUESTS
+            );
+        }
+        pushToDlq(dlqObjects);
+        numberOfRecordsFailedCounter.increment(failedRecords.size());
     }
 
     private void handleExpiredRecords(List<RetryRecord> expiredRecords, List<Record<Event>> resultRecords) {
@@ -302,7 +330,7 @@ public class BedrockBatchJobCreator extends AbstractBatchJobCreator {
 
         if (!failedRecords.isEmpty()) {
             pushToDlq(dlqObjects);
-            numberOfRecordsFailedCounter.increment(dlqObjects.size());
+            numberOfRecordsFailedCounter.increment(failedRecords.size());
         }
     }
 
@@ -316,5 +344,10 @@ public class BedrockBatchJobCreator extends AbstractBatchJobCreator {
                         : record.getData().get(inputKey, String.class))
                 .orElseThrow(() -> new IllegalArgumentException("Missing 'S3 Key' in record."));
         return "s3://" + bucket + "/" + key;
+    }
+
+    @Override
+    public boolean isReadyForShutdown() {
+        return throttledRecords.isEmpty();
     }
 }

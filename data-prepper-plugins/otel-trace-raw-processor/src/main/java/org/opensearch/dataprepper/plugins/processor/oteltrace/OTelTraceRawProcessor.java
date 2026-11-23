@@ -415,11 +415,14 @@ public class OTelTraceRawProcessor extends AbstractProcessor<Record<Span>, Recor
                     while (entryIterator.hasNext()) {
                         final Map.Entry<String, SpanSet> entry = entryIterator.next();
                         final String traceId = entry.getKey();
-                        final TraceGroup traceGroup = traceIdTraceGroupCache.getIfPresent(traceId);
-                        final SpanSet spanSet = entry.getValue();
-                        final long traceTime = spanSet.getTimeSeen();
+                        final long traceTime = entry.getValue().getTimeSeen();
                         if (now - traceTime >= traceFlushInterval || isShuttingDown) {
-                            final Set<Span> spans = spanSet.getSpans();
+                            final SpanSet claimedSpanSet = traceIdSpanSetMap.remove(traceId);
+                            if (claimedSpanSet == null) {
+                                continue;
+                            }
+                            final TraceGroup traceGroup = traceIdTraceGroupCache.getIfPresent(traceId);
+                            final Set<Span> spans = claimedSpanSet.getSpans();
                             if (traceGroup != null) {
                                 spans.forEach(span -> {
                                     fillInTraceGroupInfo(span, traceGroup);
@@ -433,7 +436,6 @@ public class OTelTraceRawProcessor extends AbstractProcessor<Record<Span>, Recor
                                     LOG.debug("Missing trace group for SpanId: {}", span.getSpanId());
                                 });
                             }
-                            entryIterator.remove();
                         }
                     }
                     if (!recordsToFlush.isEmpty()) {
@@ -482,6 +484,11 @@ public class OTelTraceRawProcessor extends AbstractProcessor<Record<Span>, Recor
     @Override
     public boolean isReadyForShutdown() {
         return traceIdSpanSetMap.isEmpty() && heldRootSpansByTraceId.isEmpty();
+    }
+
+    @Override
+    public boolean holdsEvents() {
+        return true;
     }
 
     @Override
