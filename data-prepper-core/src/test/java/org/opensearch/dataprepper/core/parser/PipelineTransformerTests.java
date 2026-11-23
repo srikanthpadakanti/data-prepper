@@ -65,6 +65,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
 
+import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.notNullValue;
@@ -74,10 +75,15 @@ import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.core.Is.is;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -398,6 +404,164 @@ class PipelineTransformerTests {
         }
         assertTrue(failurePipeline.getSource() instanceof HeadlessPipelineSource);
         assertThat(((HeadlessPipelineSource)failurePipeline.getSource()).getAcknowledgementsEnabled(), equalTo(false));
+    }
+
+    @Test
+    void transformConfiguration_with_strict_acknowledgements_and_valid_pipelines_builds_all_pipelines() {
+        when(dataPrepperConfiguration.getFailurePipelineName()).thenReturn(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME);
+        mockDataPrepperConfigurationAccesses();
+        final PipelineTransformer pipelineTransformer =
+                createObjectUnderTest(TestDataProvider.STRICT_ACKNOWLEDGEMENTS_VALID_CONFIG_FILE);
+
+        final Map<String, Pipeline> pipelineMap = pipelineTransformer.transformConfiguration(this.pipelinesDataFlowModel);
+
+        assertThat(pipelineMap.keySet(), equalTo(Set.of("entry-pipeline", "downstream-pipeline",
+                DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME)));
+        verifyDataPrepperConfigurationAccesses(3);
+        verify(pluginErrorsHandler, never()).handleErrors(anyCollection());
+        assertThat(failurePipelineAcknowledgementsEnabled(pipelineMap), equalTo(true));
+    }
+
+    @Test
+    void transformConfiguration_with_strict_acknowledgements_without_failure_pipeline_skips_the_pipeline() {
+        when(dataPrepperConfiguration.getFailurePipelineName()).thenReturn(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME);
+        mockDataPrepperConfigurationAccesses();
+        final PipelineTransformer pipelineTransformer =
+                createObjectUnderTest(TestDataProvider.STRICT_ACKNOWLEDGEMENTS_WITHOUT_FAILURE_PIPELINE_CONFIG_FILE);
+
+        final Map<String, Pipeline> pipelineMap = pipelineTransformer.transformConfiguration(this.pipelinesDataFlowModel);
+
+        assertThat(pipelineMap.size(), equalTo(0));
+        verifyDataPrepperConfigurationAccesses(1);
+        verify(pluginErrorsHandler).handleErrors(pluginErrorsArgumentCaptor.capture());
+        final List<PluginError> pluginErrors = new ArrayList<>(pluginErrorsArgumentCaptor.getValue());
+        assertThat(pluginErrors.size(), equalTo(1));
+        assertThat(pluginErrors.get(0).getPipelineName(), equalTo("entry-pipeline"));
+        assertThat(pluginErrors.get(0).getPluginName(), equalTo("test_strict_acknowledgement_source"));
+        assertThat(pluginErrors.get(0).getComponentType(), equalTo(PipelineModel.SOURCE_PLUGIN_TYPE));
+        assertThat(pluginErrors.get(0).getException(), instanceOf(InvalidPluginConfigurationException.class));
+        assertThat(pluginErrors.get(0).getException().getMessage(), containsString(
+                "require the failure pipeline [" + DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME + "]"));
+    }
+
+    @Test
+    void transformConfiguration_with_strict_acknowledgements_and_downstream_sink_without_dlq_skips_connected_pipelines() {
+        when(dataPrepperConfiguration.getFailurePipelineName()).thenReturn(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME);
+        mockDataPrepperConfigurationAccesses();
+        final PipelineTransformer pipelineTransformer =
+                createObjectUnderTest(TestDataProvider.STRICT_ACKNOWLEDGEMENTS_DOWNSTREAM_SINK_WITHOUT_DLQ_CONFIG_FILE);
+
+        final Map<String, Pipeline> pipelineMap = pipelineTransformer.transformConfiguration(this.pipelinesDataFlowModel);
+
+        assertThat(pipelineMap.keySet(), equalTo(Set.of(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME)));
+        verifyDataPrepperConfigurationAccesses(3);
+        verify(pluginErrorsHandler).handleErrors(pluginErrorsArgumentCaptor.capture());
+        final List<PluginError> pluginErrors = new ArrayList<>(pluginErrorsArgumentCaptor.getValue());
+        assertThat(pluginErrors.size(), equalTo(1));
+        assertThat(pluginErrors.get(0).getException().getMessage(),
+                containsString("Sink [stdout] in pipeline [downstream-pipeline]"));
+        assertThat(failurePipelineAcknowledgementsEnabled(pipelineMap), equalTo(false));
+    }
+
+    @Test
+    void transformConfiguration_with_strict_acknowledgements_and_downstream_processor_holding_events_skips_connected_pipelines() {
+        when(dataPrepperConfiguration.getFailurePipelineName()).thenReturn(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME);
+        mockDataPrepperConfigurationAccesses();
+        final PipelineTransformer pipelineTransformer =
+                createObjectUnderTest(TestDataProvider.STRICT_ACKNOWLEDGEMENTS_DOWNSTREAM_PROCESSOR_HOLDS_EVENTS_CONFIG_FILE);
+
+        final Map<String, Pipeline> pipelineMap = pipelineTransformer.transformConfiguration(this.pipelinesDataFlowModel);
+
+        assertThat(pipelineMap.keySet(), equalTo(Set.of(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME)));
+        verifyDataPrepperConfigurationAccesses(2);
+        final List<PluginError> pluginErrors = captureSinglePluginErrorsCall();
+        assertThat(pluginErrors.size(), equalTo(1));
+        assertThat(pluginErrors.get(0).getComponentType(), equalTo(PipelineModel.PROCESSOR_PLUGIN_TYPE));
+        assertThat(pluginErrors.get(0).getPipelineName(), equalTo("downstream-pipeline"));
+        assertThat(pluginErrors.get(0).getPluginName(), equalTo("test_holding_events_processor"));
+        assertThat(pluginErrors.get(0).getException().getMessage(),
+                containsString("Processor [test_holding_events_processor] in pipeline [downstream-pipeline]"));
+    }
+
+    @Test
+    void transformConfiguration_with_strict_acknowledgements_and_peer_forwarding_processor_skips_pipeline_before_registering_it() {
+        when(dataPrepperConfiguration.getFailurePipelineName()).thenReturn(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME);
+        mockDataPrepperConfigurationAccesses();
+        final PipelineTransformer pipelineTransformer =
+                createObjectUnderTest(TestDataProvider.STRICT_ACKNOWLEDGEMENTS_PEER_FORWARDING_PROCESSOR_CONFIG_FILE);
+
+        final Map<String, Pipeline> pipelineMap = pipelineTransformer.transformConfiguration(this.pipelinesDataFlowModel);
+
+        assertThat(pipelineMap.keySet(), equalTo(Set.of(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME)));
+        verifyDataPrepperConfigurationAccesses(1);
+        verify(peerForwarderProvider, never()).register(anyString(), any(), anyString(), anySet(), anyInt());
+        final List<PluginError> pluginErrors = captureSinglePluginErrorsCall();
+        assertThat(pluginErrors.size(), equalTo(1));
+        assertThat(pluginErrors.get(0).getPluginName(), equalTo("test_peer_forwarding_processor"));
+        assertThat(pluginErrors.get(0).getException().getMessage(),
+                containsString("Processor [test_peer_forwarding_processor] in pipeline [entry-pipeline]"));
+    }
+
+    @Test
+    void transformConfiguration_with_strict_acknowledgements_and_byte_buffer_skips_the_pipeline() {
+        when(dataPrepperConfiguration.getFailurePipelineName()).thenReturn(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME);
+        mockDataPrepperConfigurationAccesses();
+        final PipelineTransformer pipelineTransformer =
+                createObjectUnderTest(TestDataProvider.STRICT_ACKNOWLEDGEMENTS_BYTE_BUFFER_CONFIG_FILE);
+
+        final Map<String, Pipeline> pipelineMap = pipelineTransformer.transformConfiguration(this.pipelinesDataFlowModel);
+
+        assertThat(pipelineMap.keySet(), equalTo(Set.of(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME)));
+        verifyDataPrepperConfigurationAccesses(2);
+        final List<PluginError> pluginErrors = captureSinglePluginErrorsCall();
+        assertThat(pluginErrors.size(), equalTo(1));
+        assertThat(pluginErrors.get(0).getException().getMessage(),
+                containsString("Buffer [test_byte_buffer] in pipeline [entry-pipeline]"));
+    }
+
+    @Test
+    void transformConfiguration_with_strict_acknowledgements_and_forward_to_pipeline_with_processor_holding_events_skips_the_pipeline() {
+        when(dataPrepperConfiguration.getFailurePipelineName()).thenReturn(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME);
+        mockDataPrepperConfigurationAccesses();
+        final PipelineTransformer pipelineTransformer =
+                createObjectUnderTest(TestDataProvider.STRICT_ACKNOWLEDGEMENTS_FORWARD_TO_PROCESSOR_HOLDS_EVENTS_CONFIG_FILE);
+
+        final Map<String, Pipeline> pipelineMap = pipelineTransformer.transformConfiguration(this.pipelinesDataFlowModel);
+
+        assertThat(pipelineMap.keySet(), equalTo(Set.of("forwarded-pipeline", DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME)));
+        verifyDataPrepperConfigurationAccesses(3);
+        final List<PluginError> pluginErrors = captureSinglePluginErrorsCall();
+        assertThat(pluginErrors.size(), equalTo(1));
+        assertThat(pluginErrors.get(0).getPipelineName(), equalTo("entry-pipeline"));
+        assertThat(pluginErrors.get(0).getException().getMessage(),
+                containsString("Processor [test_holding_events_processor] in pipeline [forwarded-pipeline]"));
+    }
+
+    @Test
+    void transformConfiguration_with_strict_acknowledgements_and_failure_pipeline_with_source_skips_the_pipeline() {
+        when(dataPrepperConfiguration.getFailurePipelineName()).thenReturn(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME);
+        mockDataPrepperConfigurationAccesses();
+        final PipelineTransformer pipelineTransformer =
+                createObjectUnderTest(TestDataProvider.STRICT_ACKNOWLEDGEMENTS_FAILURE_PIPELINE_WITH_SOURCE_CONFIG_FILE);
+
+        final Map<String, Pipeline> pipelineMap = pipelineTransformer.transformConfiguration(this.pipelinesDataFlowModel);
+
+        assertThat(pipelineMap.keySet(), equalTo(Set.of(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME)));
+        verifyDataPrepperConfigurationAccesses(2);
+        final List<PluginError> pluginErrors = captureSinglePluginErrorsCall();
+        assertThat(pluginErrors.size(), equalTo(1));
+        assertThat(pluginErrors.get(0).getException().getMessage(), containsString(
+                "require the failure pipeline [" + DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME + "] without a source"));
+    }
+
+    private List<PluginError> captureSinglePluginErrorsCall() {
+        verify(pluginErrorsHandler).handleErrors(pluginErrorsArgumentCaptor.capture());
+        return new ArrayList<>(pluginErrorsArgumentCaptor.getValue());
+    }
+
+    private boolean failurePipelineAcknowledgementsEnabled(final Map<String, Pipeline> pipelineMap) {
+        final Pipeline failurePipeline = pipelineMap.get(DataPrepperConfiguration.DEFAULT_FAILURE_PIPELINE_NAME);
+        return ((HeadlessPipelineSource) failurePipeline.getSource()).getAcknowledgementsEnabled();
     }
 
     @Test

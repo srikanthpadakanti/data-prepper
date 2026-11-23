@@ -31,6 +31,7 @@ import org.opensearch.dataprepper.model.plugin.PluginConfigObservable;
 import org.opensearch.dataprepper.model.plugin.PluginFactory;
 import org.opensearch.dataprepper.model.record.Record;
 import org.opensearch.dataprepper.model.sink.SinkContext;
+import org.opensearch.dataprepper.plugins.sink.opensearch.configuration.PullIndexingConfig;
 import org.opensearch.dataprepper.plugins.sink.opensearch.configuration.OpenSearchSinkConfig;
 import org.opensearch.dataprepper.plugins.sink.opensearch.index.IndexConfiguration;
 import org.opensearch.dataprepper.plugins.sink.opensearch.index.IndexManager;
@@ -206,6 +207,21 @@ public class OpenSearchSinkTest {
             objectUnderTest.initialize();
         }
         verify(pluginConfigObservable, times(2)).addPluginConfigObserver(any());
+    }
+
+    @Test
+    void handlesFailedEvents_without_pull_indexing_returns_true() throws IOException {
+        final OpenSearchSink objectUnderTest = createObjectUnderTest();
+
+        assertThat(objectUnderTest.handlesFailedEvents(), equalTo(true));
+    }
+
+    @Test
+    void handlesFailedEvents_with_pull_indexing_returns_false() throws IOException {
+        when(openSearchSinkConfig.getPullIndexing()).thenReturn(mock(PullIndexingConfig.class));
+        final OpenSearchSink objectUnderTest = createObjectUnderTest();
+
+        assertThat(objectUnderTest.handlesFailedEvents(), equalTo(false));
     }
 
     @Test

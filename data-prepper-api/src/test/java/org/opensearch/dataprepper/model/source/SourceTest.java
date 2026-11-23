@@ -14,6 +14,8 @@ import org.opensearch.dataprepper.model.event.Event;
 import org.opensearch.dataprepper.model.pipeline.HeadlessPipeline;
 import org.junit.jupiter.api.Test;
 
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -25,6 +27,13 @@ public class SourceTest {
       Source<Record<Event>> objectUnderTest = mock(Source.class);
       when(objectUnderTest.areAcknowledgementsEnabled()).thenCallRealMethod();
       assertFalse(objectUnderTest.areAcknowledgementsEnabled());
+    }
+
+    @Test
+    void requiresStrictAcknowledgementValidation_by_default_returns_false() {
+      final Source<Record<Event>> objectUnderTest = mock(Source.class);
+      when(objectUnderTest.requiresStrictAcknowledgementValidation()).thenCallRealMethod();
+      assertThat(objectUnderTest.requiresStrictAcknowledgementValidation(), equalTo(false));
     }
 
     @Test

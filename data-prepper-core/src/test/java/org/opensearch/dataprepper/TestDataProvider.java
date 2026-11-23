@@ -34,6 +34,20 @@ public class TestDataProvider {
     public static final String VALID_MULTIPLE_SINKS_WITH_FAILURE_PIPELINE_CONFIG_FILE = "src/test/resources/valid_multiple_sinks_with_routes_with_failure_pipeline.yml";
     public static final String COMPATIBLE_VERSION_CONFIG_FILE = "src/test/resources/compatible_version.yml";
     public static final String VALID_MULTIPLE_PROCESSERS_CONFIG_FILE = "src/test/resources/valid_multiple_processors.yml";
+    public static final String STRICT_ACKNOWLEDGEMENTS_VALID_CONFIG_FILE = "src/test/resources/strict_acknowledgements_valid.yml";
+    public static final String STRICT_ACKNOWLEDGEMENTS_WITHOUT_FAILURE_PIPELINE_CONFIG_FILE =
+            "src/test/resources/strict_acknowledgements_without_failure_pipeline.yml";
+    public static final String STRICT_ACKNOWLEDGEMENTS_DOWNSTREAM_SINK_WITHOUT_DLQ_CONFIG_FILE =
+            "src/test/resources/strict_acknowledgements_downstream_sink_without_dlq.yml";
+    public static final String STRICT_ACKNOWLEDGEMENTS_DOWNSTREAM_PROCESSOR_HOLDS_EVENTS_CONFIG_FILE =
+            "src/test/resources/strict_acknowledgements_downstream_processor_holds_events.yml";
+    public static final String STRICT_ACKNOWLEDGEMENTS_PEER_FORWARDING_PROCESSOR_CONFIG_FILE =
+            "src/test/resources/strict_acknowledgements_peer_forwarding_processor.yml";
+    public static final String STRICT_ACKNOWLEDGEMENTS_BYTE_BUFFER_CONFIG_FILE = "src/test/resources/strict_acknowledgements_byte_buffer.yml";
+    public static final String STRICT_ACKNOWLEDGEMENTS_FORWARD_TO_PROCESSOR_HOLDS_EVENTS_CONFIG_FILE =
+            "src/test/resources/strict_acknowledgements_forward_to_processor_holds_events.yml";
+    public static final String STRICT_ACKNOWLEDGEMENTS_FAILURE_PIPELINE_WITH_SOURCE_CONFIG_FILE =
+            "src/test/resources/strict_acknowledgements_failure_pipeline_with_source.yml";
     public static final String VALID_DATA_PREPPER_CONFIG_FILE = "src/test/resources/valid_data_prepper_config.yml";
     public static final String VALID_DATA_PREPPER_CONFIG_FILE_WITH_BASIC_AUTHENTICATION = "src/test/resources/valid_data_prepper_config_with_basic_authentication.yml";
     public static final String VALID_DATA_PREPPER_CONFIG_FILE_WITH_CAMEL_CASE_OPTIONS = "src/test/resources/valid_data_prepper_config_with_camel_case_options.yml";

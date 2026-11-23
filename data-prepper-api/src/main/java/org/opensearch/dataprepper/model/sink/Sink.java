@@ -54,6 +54,17 @@ public interface Sink<T extends Record<?>> {
     }
 
     /**
+     * Indicates if the sink sends events it cannot write to the failure pipeline or to its own DLQ
+     * instead of dropping them.
+     *
+     * @return true if the sink sends failed events to the failure pipeline or to a DLQ
+     * @since 2.18
+     */
+    default boolean handlesFailedEvents() {
+        return false;
+    }
+
+    /**
      * Sets default failure pipeline of a source
 
      * @param failurePipeline failure pipeline

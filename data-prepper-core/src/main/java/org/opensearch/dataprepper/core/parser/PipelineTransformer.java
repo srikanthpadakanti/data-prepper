@@ -48,14 +48,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static java.lang.String.format;
 
@@ -78,6 +82,8 @@ public class PipelineTransformer {
     private final PluginErrorCollector pluginErrorCollector;
     private final PluginErrorsHandler pluginErrorsHandler;
     private final Map<Sink, SinkContext> sinkToSinkContextMap;
+    private final StrictAcknowledgementValidator strictAcknowledgementValidator;
+    private final Set<String> strictAcknowledgementPipelineNames = new HashSet<>();
 
     private final ExpressionEvaluator expressionEvaluator;
 
@@ -105,6 +111,7 @@ public class PipelineTransformer {
         this.pluginErrorsHandler = pluginErrorsHandler;
         this.expressionEvaluator = expressionEvaluator;
         this.sinkToSinkContextMap = new LinkedHashMap<>();
+        this.strictAcknowledgementValidator = new StrictAcknowledgementValidator();
     }
 
     public Map<String, Pipeline> transformConfiguration(final PipelinesDataFlowModel pipelinesDataFlowModel) {
@@ -126,6 +133,8 @@ public class PipelineTransformer {
                 buildPipelineFromConfiguration(pipelineName, pipelineConfigurationMap, pipelineMap);
             }
         }
+        validateStrictAcknowledgements(pipelineConfigurationMap, pipelineMap);
+        wireFailurePipeline(pipelineMap);
         Map<String, HeadlessPipeline> headlessPipelines = new LinkedHashMap<>();
         for (Map.Entry<String, Pipeline> pipeline: pipelineMap.entrySet()){
             if (pipeline.getValue().getSource() instanceof HeadlessPipelineSource) {
@@ -146,7 +155,6 @@ public class PipelineTransformer {
             final Map<String, Pipeline> pipelineMap) {
         final PipelineConfiguration pipelineConfiguration = pipelineConfigurationMap.get(pipelineName);
         LOG.info("Building pipeline [{}] from provided configuration", pipelineName);
-        final String failurePipelineName = dataPrepperConfiguration.getFailurePipelineName();
         try {
             Source source;
             final PluginSetting sourceSetting = pipelineConfiguration.getSourcePluginSetting();
@@ -210,6 +218,10 @@ public class PipelineTransformer {
                     .collect(Collectors.toList());
 
             invalidRouteExpressions.forEach(pluginErrorCollector::collectPluginError);
+            if (requiresStrictAcknowledgements(source, sourceSetting)) {
+                strictAcknowledgementPipelineNames.add(pipelineName);
+                collectStrictAcknowledgementProcessorErrors(pipelineName, processorSets);
+            }
             final List<PluginError> subPipelinePluginErrors = pluginErrorCollector.getPluginErrors()
                     .stream().filter(pluginError -> pipelineName.equals(pluginError.getPipelineName()))
                     .collect(Collectors.toList());
@@ -277,6 +289,8 @@ public class PipelineTransformer {
                 }
             }
 
+            recordStrictAcknowledgementFacts(pipelineName, pipelineConfiguration, bufferPluginSetting, pipelineDefinedBuffer,
+                    processorSets, sinks);
             pipelineMap.put(pipelineName, pipeline);
         } catch (Exception ex) {
             //If pipeline construction errors out, we will skip that pipeline and proceed
@@ -284,6 +298,11 @@ public class PipelineTransformer {
                     "pipelines", pipelineName, ex);
             processRemoveIfRequired(pipelineName, pipelineConfigurationMap, pipelineMap);
         }
+        wireFailurePipeline(pipelineMap);
+    }
+
+    private void wireFailurePipeline(final Map<String, Pipeline> pipelineMap) {
+        final String failurePipelineName = dataPrepperConfiguration.getFailurePipelineName();
         final Pipeline failurePipeline = pipelineMap.get(failurePipelineName);
         boolean acknowledgementsEnabled = false;
         if (failurePipeline != null) {
@@ -296,7 +315,93 @@ public class PipelineTransformer {
             }
             failurePipeline.setAcknowledgementsEnabled(acknowledgementsEnabled);
         }
+    }
 
+    private boolean requiresStrictAcknowledgements(final Source source, final PluginSetting sourceSetting) {
+        if (source != null && source.requiresStrictAcknowledgementValidation()) {
+            return true;
+        }
+        return getPipelineNameIfPipelineType(sourceSetting)
+                .filter(strictAcknowledgementPipelineNames::contains)
+                .isPresent();
+    }
+
+    private void collectStrictAcknowledgementProcessorErrors(
+            final String pipelineName,
+            final List<List<IdentifiedComponent<Processor>>> processorSets) {
+        processorSets.stream()
+                .filter(processors -> !processors.isEmpty())
+                .map(processors -> processors.get(0))
+                .forEach(processor -> strictAcknowledgementValidator
+                        .findProcessorProblem(pipelineName, processor.getName(), processor.getComponent())
+                        .ifPresent(problem -> pluginErrorCollector.collectPluginError(PluginError.builder()
+                                .componentType(PipelineModel.PROCESSOR_PLUGIN_TYPE)
+                                .pipelineName(pipelineName)
+                                .pluginName(processor.getName())
+                                .exception(new InvalidPluginConfigurationException(problem))
+                                .build())));
+    }
+
+    private void recordStrictAcknowledgementFacts(
+            final String pipelineName,
+            final PipelineConfiguration pipelineConfiguration,
+            final PluginSetting bufferPluginSetting,
+            final Buffer pipelineDefinedBuffer,
+            final List<List<IdentifiedComponent<Processor>>> processorSets,
+            final List<DataFlowComponent<Sink>> sinks) {
+        final List<SinkContextPluginSetting> sinkPluginSettings = pipelineConfiguration.getSinkPluginSettings();
+        final List<String> downstreamPipelineNames = sinkPluginSettings.stream()
+                .flatMap(sinkPluginSetting -> Stream.concat(
+                        getPipelineNameIfPipelineType(sinkPluginSetting).stream(),
+                        sinkPluginSetting.getSinkContext().getForwardToPipelines().keySet().stream()))
+                .collect(Collectors.toList());
+        strictAcknowledgementValidator.recordPipeline(pipelineName, downstreamPipelineNames);
+        strictAcknowledgementValidator.recordBuffer(pipelineName, bufferPluginSetting.getName(), pipelineDefinedBuffer);
+        processorSets.stream()
+                .flatMap(List::stream)
+                .forEach(processor -> strictAcknowledgementValidator.recordProcessor(
+                        pipelineName, processor.getName(), processor.getComponent()));
+        for (int index = 0; index < sinks.size(); index++) {
+            final Sink sink = sinks.get(index).getComponent();
+            if (!(sink instanceof PipelineConnector)) {
+                strictAcknowledgementValidator.recordSink(pipelineName, sinkPluginSettings.get(index).getName(), sink);
+            }
+        }
+    }
+
+    private void validateStrictAcknowledgements(
+            final Map<String, PipelineConfiguration> pipelineConfigurationMap,
+            final Map<String, Pipeline> pipelineMap) {
+        final String failurePipelineName = dataPrepperConfiguration.getFailurePipelineName();
+        for (final String pipelineName : new ArrayList<>(pipelineMap.keySet())) {
+            final Pipeline pipeline = pipelineMap.get(pipelineName);
+            if (pipeline == null || !pipeline.getSource().requiresStrictAcknowledgementValidation()) {
+                continue;
+            }
+            final boolean failurePipelineExists = failurePipelineName != null && pipelineMap.containsKey(failurePipelineName) &&
+                    pipelineMap.get(failurePipelineName).getSource() instanceof HeadlessPipelineSource;
+            final List<String> problems = strictAcknowledgementValidator.findProblems(
+                    pipelineName, failurePipelineName, failurePipelineExists);
+            if (problems.isEmpty()) {
+                continue;
+            }
+            final String sourceName = Optional.ofNullable(pipelineConfigurationMap.get(pipelineName))
+                    .map(PipelineConfiguration::getSourcePluginSetting)
+                    .map(PluginSetting::getName)
+                    .orElse(null);
+            final List<PluginError> pluginErrors = problems.stream()
+                    .map(problem -> PluginError.builder()
+                            .componentType(PipelineModel.SOURCE_PLUGIN_TYPE)
+                            .pipelineName(pipelineName)
+                            .pluginName(sourceName)
+                            .exception(new InvalidPluginConfigurationException(problem))
+                            .build())
+                    .collect(Collectors.toList());
+            pluginErrorsHandler.handleErrors(pluginErrors);
+            LOG.error("Pipeline [{}] does not meet the requirements for acknowledgments, skipping building of it " +
+                    "and its connected pipelines", pipelineName);
+            processRemoveIfRequired(pipelineName, pipelineConfigurationMap, pipelineMap);
+        }
     }
 
     private List<IdentifiedComponent<Processor>> newProcessor(final PluginSetting pluginSetting) {

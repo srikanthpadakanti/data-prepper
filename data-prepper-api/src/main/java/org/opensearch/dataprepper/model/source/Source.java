@@ -45,6 +45,17 @@ public interface Source<T extends Record<?>> extends HasByteDecoder {
     }
 
     /**
+     * Indicates if Data Prepper must validate at startup that every pipeline receiving events from this source
+     * acknowledges an event only after a sink has written it or sent it to a failure destination.
+     *
+     * @return true if the strict acknowledgement validation applies to this source
+     * @since 2.18
+     */
+    default boolean requiresStrictAcknowledgementValidation() {
+        return false;
+    }
+
+    /**
      * Sets default failure pipeline of a source
 
      * @param failurePipeline failure pipeline
