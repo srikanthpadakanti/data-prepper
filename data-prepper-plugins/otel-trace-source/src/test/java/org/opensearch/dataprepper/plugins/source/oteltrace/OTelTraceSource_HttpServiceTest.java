@@ -10,6 +10,7 @@ import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Named.named;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
@@ -32,6 +33,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -61,6 +63,7 @@ import org.opensearch.dataprepper.model.configuration.PluginModel;
 import org.opensearch.dataprepper.model.configuration.PluginSetting;
 import org.opensearch.dataprepper.model.plugin.PluginFactory;
 import org.opensearch.dataprepper.model.record.Record;
+import org.opensearch.dataprepper.model.types.ByteCount;
 import org.opensearch.dataprepper.plugins.HttpBasicArmeriaHttpAuthenticationProvider;
 import org.opensearch.dataprepper.plugins.codec.CompressionOption;
 
@@ -71,6 +74,7 @@ import com.linecorp.armeria.client.WebClient;
 import com.linecorp.armeria.common.AggregatedHttpResponse;
 import com.linecorp.armeria.common.ClosedSessionException;
 import com.linecorp.armeria.common.HttpData;
+import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
@@ -242,14 +246,37 @@ class OTelTraceSource_HttpServiceTest {
     }
 
     @Test
-    void request_that_causes_overflow_exception_should_not_be_written_to_buffer_and_return_retry_information() throws Exception {
+    void request_that_causes_overflow_exception_should_not_be_written_to_buffer_and_return_request_entity_too_large() throws Exception {
         Mockito.lenient().doThrow(SizeOverflowException.class).when(buffer).writeAll(any(), anyInt());
         SOURCE.start(buffer);
 
         makeRequestAndAssertResponse("/opentelemetry.proto.collector.trace.v1.TraceService/Export", createExportTraceRequest(), (response, throwable) -> {
-            assertThat(response.status(), is(HttpStatus.INSUFFICIENT_STORAGE));
-            assertResponseBodyForRetryInformation(response, "0.100s");
+            assertThat(response.status(), is(HttpStatus.REQUEST_ENTITY_TOO_LARGE));
+            assertThat(response.headers().get(HttpHeaderNames.RETRY_AFTER), nullValue());
         });
+    }
+
+    @Test
+    void request_that_causes_timeout_exception_returns_too_many_requests_with_retry_after() throws Exception {
+        Mockito.lenient().doThrow(TimeoutException.class).when(buffer).writeAll(any(), anyInt());
+        SOURCE.start(buffer);
+
+        makeRequestAndAssertResponse("/opentelemetry.proto.collector.trace.v1.TraceService/Export", createExportTraceRequest(),
+                (response, throwable) -> {
+                    assertThat(response.status(), is(HttpStatus.TOO_MANY_REQUESTS));
+                    assertThat(response.headers().get(HttpHeaderNames.RETRY_AFTER), is("1"));
+                    assertResponseBodyForRetryInformation(response, "0.100s");
+                });
+    }
+
+    @Test
+    void request_with_body_larger_than_max_request_length_returns_request_entity_too_large() throws Exception {
+        when(oTelTraceSourceConfig.getMaxRequestLength()).thenReturn(ByteCount.ofBytes(4));
+        configureObjectUnderTest();
+        SOURCE.start(buffer);
+
+        makeRequestAndAssertResponse("/opentelemetry.proto.collector.trace.v1.TraceService/Export", createExportTraceRequest(),
+                (response, throwable) -> assertThat(response.status(), is(HttpStatus.REQUEST_ENTITY_TOO_LARGE)));
     }
 
     @Test

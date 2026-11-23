@@ -32,6 +32,8 @@ source:
 
 Data Prepper replies with a `RetryInfo` specifying how long to wait for the next request in case backpressure builds up. The retry information is implemented as exponential backoff, with a max delay of `retry_info.max_delay`.
 
+Over HTTP, request and buffer-write timeouts are answered with `429 Too Many Requests` and a `Retry-After` header that carries the same delay in whole seconds, rounded up. A request that is larger than `max_request_length` or the buffer capacity is answered with `413 Payload Too Large`, because retrying it cannot succeed.
+
 ```yaml
 source:
   otel_trace_source:

@@ -10,9 +10,9 @@
 
 package org.opensearch.dataprepper.plugins.source.otellogs;
 
-import static com.linecorp.armeria.common.HttpStatus.INSUFFICIENT_STORAGE;
 import static com.linecorp.armeria.common.HttpStatus.INTERNAL_SERVER_ERROR;
 import static com.linecorp.armeria.common.HttpStatus.REQUEST_ENTITY_TOO_LARGE;
+import static com.linecorp.armeria.common.HttpStatus.TOO_MANY_REQUESTS;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
@@ -359,8 +359,8 @@ class OTelLogsSourceHttpTest {
         @Override
         public Stream<? extends Arguments> provideArguments(final ExtensionContext context) {
             return Stream.of(
-                    arguments(TimeoutException.class, INSUFFICIENT_STORAGE),
-                    arguments(SizeOverflowException.class, INSUFFICIENT_STORAGE),
+                    arguments(TimeoutException.class, TOO_MANY_REQUESTS),
+                    arguments(SizeOverflowException.class, REQUEST_ENTITY_TOO_LARGE),
                     arguments(Exception.class, INTERNAL_SERVER_ERROR),
                     arguments(RuntimeException.class, INTERNAL_SERVER_ERROR)
             );

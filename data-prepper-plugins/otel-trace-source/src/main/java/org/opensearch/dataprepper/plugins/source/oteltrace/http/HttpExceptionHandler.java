@@ -1,7 +1,18 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ *
+ */
+
 package org.opensearch.dataprepper.plugins.source.oteltrace.http;
 
 
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.TimeoutException;
 
 import org.opensearch.dataprepper.InvalidRequestExceptions;
@@ -18,10 +29,16 @@ import com.google.protobuf.Any;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.util.JsonFormat;
 import com.google.rpc.RetryInfo;
+import com.linecorp.armeria.common.ContentTooLargeException;
+import com.linecorp.armeria.common.HttpData;
+import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
+import com.linecorp.armeria.common.ResponseHeaders;
+import com.linecorp.armeria.common.ResponseHeadersBuilder;
+import com.linecorp.armeria.server.HttpStatusException;
 import com.linecorp.armeria.server.RequestTimeoutException;
 import com.linecorp.armeria.server.ServiceRequestContext;
 import com.linecorp.armeria.server.annotation.ExceptionHandlerFunction;
@@ -37,6 +54,7 @@ public class HttpExceptionHandler implements ExceptionHandlerFunction {
     public static final String BAD_REQUESTS = "badRequests";
     public static final String REQUESTS_TOO_LARGE = "requestsTooLarge";
     public static final String INTERNAL_SERVER_ERROR = "internalServerError";
+    private static final long MINIMUM_RETRY_AFTER_SECONDS = 1;
 
     private final Counter requestTimeoutsCounter;
     private final Counter badRequestsCounter;
@@ -56,7 +74,11 @@ public class HttpExceptionHandler implements ExceptionHandlerFunction {
     public HttpResponse handleException(final ServiceRequestContext ctx,
                                         final HttpRequest req,
                                         final Throwable e) {
-        final Throwable exceptionCause = e instanceof BufferWriteException ? e.getCause() : e;
+        Throwable exceptionCause = e;
+        while ((exceptionCause instanceof BufferWriteException || exceptionCause instanceof HttpStatusException)
+                && exceptionCause.getCause() != null) {
+            exceptionCause = exceptionCause.getCause();
+        }
         StatusHolder statusHolder = createStatus(exceptionCause);
 
         try {
@@ -65,7 +87,12 @@ public class HttpExceptionHandler implements ExceptionHandlerFunction {
                     .build();
 
             JsonFormat.Printer printer = JsonFormat.printer().usingTypeRegistry(typeRegistry);
-            return HttpResponse.of(statusHolder.getHttpStatus(), MediaType.JSON, printer.print(statusHolder.getStatus()));
+            final ResponseHeadersBuilder headersBuilder = ResponseHeaders.builder(statusHolder.getHttpStatus())
+                    .contentType(MediaType.JSON);
+            if (statusHolder.getHttpStatus() == HttpStatus.TOO_MANY_REQUESTS) {
+                headersBuilder.add(HttpHeaderNames.RETRY_AFTER, createRetryAfter(statusHolder.getStatus().getDetailsList()));
+            }
+            return HttpResponse.of(headersBuilder.build(), HttpData.ofUtf8(printer.print(statusHolder.getStatus())));
         } catch (InvalidProtocolBufferException ipbe) {
             throw new RuntimeException(ipbe);
         }
@@ -74,10 +101,12 @@ public class HttpExceptionHandler implements ExceptionHandlerFunction {
     private StatusHolder createStatus(Throwable e) {
         if (e instanceof RequestTimeoutException || e instanceof TimeoutException) {
             requestTimeoutsCounter.increment();
-            return new StatusHolder(createStatus(e, Status.Code.RESOURCE_EXHAUSTED), createHttpStatusFromProtoBufStatus(Status.Code.RESOURCE_EXHAUSTED));
-        } else if (e instanceof SizeOverflowException) {
+            return new StatusHolder(createStatus(e, Status.Code.RESOURCE_EXHAUSTED).toBuilder()
+                    .addDetails(Any.pack(retryInfoCalculator.createRetryInfo()))
+                    .build(), HttpStatus.TOO_MANY_REQUESTS);
+        } else if (e instanceof SizeOverflowException || e instanceof ContentTooLargeException) {
             requestsTooLargeCounter.increment();
-            return new StatusHolder(createStatus(e, Status.Code.RESOURCE_EXHAUSTED), createHttpStatusFromProtoBufStatus(Status.Code.RESOURCE_EXHAUSTED));
+            return new StatusHolder(createStatus(e, Status.Code.RESOURCE_EXHAUSTED), HttpStatus.REQUEST_ENTITY_TOO_LARGE);
         } else if (e instanceof BadRequestException) {
             badRequestsCounter.increment();
             return new StatusHolder(createStatus(e, Status.Code.INVALID_ARGUMENT), createHttpStatusFromProtoBufStatus(Status.Code.INVALID_ARGUMENT));
@@ -100,13 +129,22 @@ public class HttpExceptionHandler implements ExceptionHandlerFunction {
     }
 
     private HttpStatus createHttpStatusFromProtoBufStatus(Status.Code status) {
-        if (status == Status.Code.RESOURCE_EXHAUSTED) {
-            return HttpStatus.INSUFFICIENT_STORAGE;
-        } else if (status == Status.Code.INVALID_ARGUMENT) {
+        if (status == Status.Code.INVALID_ARGUMENT) {
             return HttpStatus.BAD_REQUEST;
         } else {
             return HttpStatus.INTERNAL_SERVER_ERROR;
         }
+    }
+
+    private String createRetryAfter(final List<Any> details) throws InvalidProtocolBufferException {
+        for (final Any detail : details) {
+            if (detail.is(RetryInfo.class)) {
+                final RetryInfo retryInfo = detail.unpack(RetryInfo.class);
+                final long roundedUpSeconds = retryInfo.getRetryDelay().getSeconds() + (retryInfo.getRetryDelay().getNanos() > 0 ? 1 : 0);
+                return Long.toString(Math.max(MINIMUM_RETRY_AFTER_SECONDS, roundedUpSeconds));
+            }
+        }
+        return Long.toString(MINIMUM_RETRY_AFTER_SECONDS);
     }
 
     private com.google.rpc.Status createStatus(final Throwable e, final Status.Code code) {
@@ -120,9 +158,6 @@ public class HttpExceptionHandler implements ExceptionHandlerFunction {
         com.google.rpc.Status.Builder builder = com.google.rpc.Status.newBuilder()
                 .setCode(code.value())
                 .setMessage(message);
-        if (code == Status.Code.RESOURCE_EXHAUSTED) {
-            builder.addDetails(Any.pack(retryInfoCalculator.createRetryInfo()));
-        }
         return builder.build();
     }
 
