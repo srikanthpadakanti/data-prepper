@@ -73,8 +73,6 @@ class AcknowledgementSetMonitor implements Runnable {
             if (acknowledgementSets.size() > 0) {
                 acknowledgementSets.removeIf((ackSet) -> ((DefaultAcknowledgementSet) ackSet).isDone());
             }
-            Thread.sleep(1000);
-        } catch (InterruptedException e) {
         } finally {
             lock.unlock();
         }
