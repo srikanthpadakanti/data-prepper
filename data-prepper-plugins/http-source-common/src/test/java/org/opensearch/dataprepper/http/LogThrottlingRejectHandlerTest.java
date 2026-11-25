@@ -5,6 +5,9 @@
 
 package org.opensearch.dataprepper.http;
 
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.MatcherAssert.assertThat;
+import com.linecorp.armeria.common.HttpHeaderNames;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import com.linecorp.armeria.common.AggregatedHttpResponse;
 import com.linecorp.armeria.common.HttpRequest;
@@ -64,5 +67,26 @@ class LogThrottlingRejectHandlerTest {
         assertEquals(HttpStatus.TOO_MANY_REQUESTS, aggregatedHttpResponse.status());
         assertTrue(aggregatedHttpResponse.contentUtf8().contains(String.format("max_pending_requests:%d", TEST_MAX_PENDING_REQUEST)));
         verify(rejectedRequestsCounter, times(1)).increment();
+    }
+
+    @Test
+    public void handleRejected_with_retry_after_supplier_adds_the_header() throws Exception {
+        objectUnderTest = new LogThrottlingRejectHandler(TEST_MAX_PENDING_REQUEST, pluginMetrics, () -> "3");
+
+        final AggregatedHttpResponse aggregatedHttpResponse = objectUnderTest
+                .handleRejected(service, serviceRequestContext, httpRequest, new Throwable()).aggregate().get();
+
+        assertThat(aggregatedHttpResponse.status(), equalTo(HttpStatus.TOO_MANY_REQUESTS));
+        assertThat(aggregatedHttpResponse.headers().get(HttpHeaderNames.RETRY_AFTER), equalTo("3"));
+    }
+
+    @Test
+    public void handleRejected_without_retry_after_supplier_has_no_header() throws Exception {
+        objectUnderTest = new LogThrottlingRejectHandler(TEST_MAX_PENDING_REQUEST, pluginMetrics);
+
+        final AggregatedHttpResponse aggregatedHttpResponse = objectUnderTest
+                .handleRejected(service, serviceRequestContext, httpRequest, new Throwable()).aggregate().get();
+
+        assertThat(aggregatedHttpResponse.headers().contains(HttpHeaderNames.RETRY_AFTER), equalTo(false));
     }
 }

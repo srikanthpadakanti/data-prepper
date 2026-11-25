@@ -10,6 +10,7 @@ import com.linecorp.armeria.common.util.BlockingTaskExecutor;
 import com.linecorp.armeria.server.HttpService;
 import com.linecorp.armeria.server.Server;
 import com.linecorp.armeria.server.ServerBuilder;
+import com.linecorp.armeria.server.annotation.ExceptionHandlerFunction;
 import com.linecorp.armeria.server.encoding.DecodingService;
 import com.linecorp.armeria.server.grpc.GrpcService;
 import com.linecorp.armeria.server.grpc.GrpcServiceBuilder;
@@ -44,6 +45,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Supplier;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.function.Function;
 
@@ -241,6 +243,26 @@ public class CreateServer {
             final CertificateProviderFactory certificateProviderFactory,
             final ArmeriaHttpAuthenticationProvider authenticationProvider,
             final HttpRequestExceptionHandler httpRequestExceptionHandler, final Object logService) {
+        return createHTTPServer(buffer, certificateProviderFactory, authenticationProvider, httpRequestExceptionHandler,
+                logService, null);
+    }
+
+    /**
+     * Creates the HTTP server of an HTTP source.
+     *
+     * @param buffer the buffer of the source
+     * @param certificateProviderFactory the certificate provider factory
+     * @param authenticationProvider the authentication provider
+     * @param httpRequestExceptionHandler the exception handler of the service
+     * @param logService the annotated service
+     * @param retryAfterSupplier supplies the Retry-After value for throttled requests, or null for no header
+     * @return the server
+     */
+    public Server createHTTPServer(final Buffer<Record<Log>> buffer,
+            final CertificateProviderFactory certificateProviderFactory,
+            final ArmeriaHttpAuthenticationProvider authenticationProvider,
+            final ExceptionHandlerFunction httpRequestExceptionHandler, final Object logService,
+            final Supplier<String> retryAfterSupplier) {
         final ServerBuilder sb = Server.builder();
 
         sb.disableServerHeader();
@@ -283,7 +305,7 @@ public class CreateServer {
         final LogThrottlingStrategy logThrottlingStrategy = new LogThrottlingStrategy(
                 maxPendingRequests, blockingTaskExecutor.getQueue());
         final LogThrottlingRejectHandler logThrottlingRejectHandler = new LogThrottlingRejectHandler(maxPendingRequests,
-                pluginMetrics);
+                pluginMetrics, retryAfterSupplier);
 
         final String httpSourcePath = serverConfiguration.getPath().replace(PIPELINE_NAME_PLACEHOLDER, pipelineName);
         sb.decorator(httpSourcePath, ThrottlingService.newDecorator(logThrottlingStrategy, logThrottlingRejectHandler));

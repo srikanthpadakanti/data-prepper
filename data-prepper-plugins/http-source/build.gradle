@@ -16,6 +16,7 @@ dependencies {
     implementation project(':data-prepper-plugins:armeria-common')
     implementation project(':data-prepper-plugins:http-common')
     implementation libs.armeria.core
+    implementation libs.armeria.grpc
     implementation libs.commons.io
     implementation 'software.amazon.awssdk:acm'
     implementation 'software.amazon.awssdk:s3'

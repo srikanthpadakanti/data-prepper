@@ -19,6 +19,13 @@ source:
 * `413`: the request data size is larger than the configured capacity.
 * `429`: the request has been rejected due to the HTTP source executor being in full capacity.
 
+With `acknowledgments: true`:
+
+* `200`: the sinks acknowledged every event in the request.
+* `429` with `Retry-After`: the events were negatively acknowledged, `request_timeout` passed while waiting for the acknowledgment, the buffer was full, `max_pending_requests` requests were already waiting for acknowledgments, or the executor was full.
+* `503` with `Retry-After`: the source is shutting down.
+* `408`: `request_timeout` passed before the request body arrived.
+
 ## Configurations
 
 * port (Optional) => An `int` between 0 and 65535 represents the port source is running on. Default is ```2021```.
@@ -28,7 +35,9 @@ source:
 * request_timeout (Optional) => An `int` larger than 0 represents request timeout in millis. Default is ```10_000```. 
 * thread_count (Optional) => An `int` larger than 0 represents the number of threads to keep in the ScheduledThreadPool. Default is `200`.
 * max_connection_count (Optional) => An `int` larger than 0 represents the maximum allowed number of open connections. Default is `500`.
-* max_pending_requests (Optional) => An `int` larger than 0 represents the maximum allowed number of tasks in the ScheduledThreadPool work queue. Default is `1024`.
+* max_pending_requests (Optional) => An `int` larger than 0 represents the maximum allowed number of tasks in the ScheduledThreadPool work queue. Default is `1024`. With `acknowledgments: true`, new requests are also rejected while this many requests are waiting for acknowledgments; concurrent requests can exceed it briefly.
+* acknowledgments (Optional) => A `boolean` that enables end-to-end acknowledgments. When `true`, the source answers each request only after the sinks acknowledge every event in it, so clients that keep unsent data and retry do not lose data on a restart. `request_timeout` is the only deadline, so it must be well above the sink flush time (for the OpenSearch sink, `flush_timeout` plus the pipeline `delay`), and the client timeout must be longer than `request_timeout`. A request that timed out keeps counting against `max_pending_requests` until its events are acknowledged or twice `request_timeout` has passed, so retries do not pile up while the sinks are slow. On shutdown, new requests get `503` while the source waits up to `request_timeout` for pending requests. The pipeline must pass the strict acknowledgment checks at startup: no processor that needs peer forwarding or holds events, no byte buffer, a failure pipeline (`dlq_pipeline`), and every sink uses the failure pipeline or its own DLQ. Delivery is at least once; use `document_id` in the sink to make retries harmless. Default is `false`.
+* retry_info (Optional) => The `Retry-After` delays used when `acknowledgments` is `true`. `min_delay` (default `100ms`) is the first delay; it doubles while rejections continue, up to `max_delay` (default `2s`). The header carries whole seconds, rounded up.
 * authentication (Optional) => An authentication configuration. By default, this runs an unauthenticated server. See below for more information.
 * compression (Optional) : The compression type applied on the client request payload. Defaults to `none`. Supported values are: 
   * `none`: no compression 
@@ -109,9 +118,15 @@ curl -k -X POST -H "Content-Type: application/json" -d '[{"log": "sample log"}]'
 - `requestTimeouts`: measures total number of requests that time out in the HTTP source server (415 response status code).
 - `requestsTooLarge`: measures total number of requests of which the events size in the content is larger than the buffer capacity (413 response status code).
 - `internalServerError`: measures total number of requests processed by the HTTP source with custom exception type (500 response status code).
+- `requestsAcknowledged`, `requestsNegativelyAcknowledged`, `requestsRejectedShuttingDown`: with `acknowledgments: true`, the requests whose events were acknowledged, negatively acknowledged, or rejected while the source was shutting down.
+- `acknowledgmentTimeouts`: with `acknowledgments: true`, the requests that reached `request_timeout` while waiting for their acknowledgment.
+- `requestsRejectedPendingAcknowledgments`: with `acknowledgments: true`, the requests rejected because `max_pending_requests` requests were already waiting for acknowledgments.
+
+### Gauge
+- `requestsPendingAcknowledgement`: with `acknowledgments: true`, the number of requests waiting for their response.
 
 ### Timer
-- `requestProcessDuration`: measures latency of requests processed by the HTTP source plugin in seconds. 
+- `requestProcessDuration`: measures latency of requests processed by the HTTP source plugin in seconds. With `acknowledgments: true`, it measures until the response is sent.
 
 ### Distribution Summary
 - `payloadSize`: measures the distribution of incoming requests payload sizes in bytes.

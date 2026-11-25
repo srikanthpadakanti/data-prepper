@@ -150,6 +150,20 @@ class RequestAcknowledgementHandlerTest {
     }
 
     @Test
+    void getPendingRequests_counts_created_requests_until_their_response_is_sent() {
+        stubAcknowledgementSet();
+        final RequestAcknowledgementHandler objectUnderTest = createObjectUnderTest();
+
+        objectUnderTest.create(requestContext, Collections.emptyList());
+
+        assertThat(objectUnderTest.getPendingRequests(), equalTo(1));
+
+        requestCompleted.complete(null);
+
+        assertThat(objectUnderTest.getPendingRequests(), equalTo(0));
+    }
+
+    @Test
     void complete_completes_set_and_positive_acknowledgement_completes_future() {
         stubAcknowledgementSet();
         final PendingRequestAcknowledgement pending = createObjectUnderTest().create(requestContext, Collections.emptyList());

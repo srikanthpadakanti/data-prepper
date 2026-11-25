@@ -137,6 +137,15 @@ public class RequestAcknowledgementHandler {
     }
 
     /**
+     * Returns the number of requests whose response has not been sent yet.
+     *
+     * @return the number of pending requests
+     */
+    public int getPendingRequests() {
+        return pendingRequests.get();
+    }
+
+    /**
      * Rejects new requests from now on.
      */
     public void prepareForShutdown() {

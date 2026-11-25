@@ -7,10 +7,13 @@ package org.opensearch.dataprepper.plugins.source.loghttp;
 
 import com.linecorp.armeria.server.Server;
 import org.opensearch.dataprepper.HttpRequestExceptionHandler;
+import org.opensearch.dataprepper.RetryInfoCalculator;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.armeria.authentication.ArmeriaHttpAuthenticationProvider;
 import org.opensearch.dataprepper.http.HttpServerConfig;
 import org.opensearch.dataprepper.http.certificate.CertificateProviderFactory;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
+import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPlugin;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPluginConstructor;
 import org.opensearch.dataprepper.model.buffer.Buffer;
@@ -25,13 +28,18 @@ import org.opensearch.dataprepper.model.plugin.PluginFactory;
 import org.opensearch.dataprepper.model.record.Record;
 import org.opensearch.dataprepper.model.source.Source;
 import org.opensearch.dataprepper.plugins.server.CreateServer;
+import org.opensearch.dataprepper.plugins.server.RetryInfoConfig;
 import org.opensearch.dataprepper.plugins.server.ServerConfiguration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
+import java.util.function.Supplier;
 
 @DataPrepperPlugin(name = "http", pluginType = Source.class, pluginConfigurationType = HTTPSourceConfig.class)
 public class HTTPSource implements Source<Record<Log>> {
@@ -53,10 +61,19 @@ public class HTTPSource implements Source<Record<Log>> {
     private final InputCodec codec;
     private final List<String> metadataHeaders;
     private final HttpHeaderExtractor httpHeaderExtractor;
+    private final boolean acknowledgmentsEnabled;
+    private final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler;
+    private final Optional<HttpAcknowledgementExceptionHandler> acknowledgementExceptionHandler;
+    private final Optional<RetryAfterCalculator> retryAfterCalculator;
+
+    public HTTPSource(final HTTPSourceConfig sourceConfig, final PluginMetrics pluginMetrics, final PluginFactory pluginFactory,
+                      final PipelineDescription pipelineDescription) {
+        this(sourceConfig, pluginMetrics, pluginFactory, pipelineDescription, null);
+    }
 
     @DataPrepperPluginConstructor
     public HTTPSource(final HTTPSourceConfig sourceConfig, final PluginMetrics pluginMetrics, final PluginFactory pluginFactory,
-                      final PipelineDescription pipelineDescription) {
+                      final PipelineDescription pipelineDescription, final AcknowledgementSetManager acknowledgementSetManager) {
         this.sourceConfig = sourceConfig;
         this.pluginMetrics = pluginMetrics;
         this.pipelineName = pipelineDescription.getPipelineName();
@@ -89,6 +106,33 @@ public class HTTPSource implements Source<Record<Log>> {
             codec = pluginFactory.loadPlugin(InputCodec.class, codecPluginSettings);
         }
         httpHeaderExtractor = new HttpHeaderExtractor(metadataHeaders);
+        acknowledgmentsEnabled = sourceConfig.isAcknowledgmentsEnabled();
+        if (acknowledgmentsEnabled) {
+            final RetryInfoConfig retryInfo = sourceConfig.getRetryInfo() != null ? sourceConfig.getRetryInfo() : new RetryInfoConfig();
+            final RetryAfterCalculator calculator = new RetryAfterCalculator(
+                    new RetryInfoCalculator(retryInfo.getMinDelay(), retryInfo.getMaxDelay()));
+            retryAfterCalculator = Optional.of(calculator);
+            requestAcknowledgementHandler = Optional.of(new RequestAcknowledgementHandler(Objects.requireNonNull(acknowledgementSetManager,
+                    "acknowledgments require an AcknowledgementSetManager"),
+                    Duration.ofMillis((long) sourceConfig.getRequestTimeoutInMillis() * LogHTTPService.ACKNOWLEDGEMENT_SET_EXPIRY_FACTOR),
+                    pluginMetrics));
+            acknowledgementExceptionHandler = Optional.of(
+                    new HttpAcknowledgementExceptionHandler(httpRequestExceptionHandler, calculator, pluginMetrics));
+        } else {
+            retryAfterCalculator = Optional.empty();
+            requestAcknowledgementHandler = Optional.empty();
+            acknowledgementExceptionHandler = Optional.empty();
+        }
+    }
+
+    @Override
+    public boolean areAcknowledgementsEnabled() {
+        return acknowledgmentsEnabled;
+    }
+
+    @Override
+    public boolean requiresStrictAcknowledgementValidation() {
+        return acknowledgmentsEnabled;
     }
 
     @Override
@@ -99,8 +143,17 @@ public class HTTPSource implements Source<Record<Log>> {
         if (server == null) {
             ServerConfiguration serverConfiguration = ConvertConfiguration.convertConfiguration(sourceConfig);
             CreateServer createServer = new CreateServer(serverConfiguration, LOG, pluginMetrics, PLUGIN_NAME, pipelineName);
-            final LogHTTPService logHTTPService = new LogHTTPService(serverConfiguration.getBufferTimeoutInMillis(), buffer, pluginMetrics, codec, httpHeaderExtractor);
-            server = createServer.createHTTPServer(buffer, certificateProviderFactory, authenticationProvider, httpRequestExceptionHandler, logHTTPService);
+            final LogHTTPService logHTTPService = new LogHTTPService(serverConfiguration.getBufferTimeoutInMillis(), buffer, pluginMetrics,
+                    codec, httpHeaderExtractor, requestAcknowledgementHandler.orElse(null), acknowledgementExceptionHandler.orElse(null),
+                    serverConfiguration.getMaxPendingRequests());
+            if (acknowledgementExceptionHandler.isPresent()) {
+                server = createServer.createHTTPServer(buffer, certificateProviderFactory, authenticationProvider,
+                        acknowledgementExceptionHandler.get(), logHTTPService,
+                        retryAfterCalculator.<Supplier<String>>map(calculator -> calculator::nextRetryAfter).orElse(null));
+            } else {
+                server = createServer.createHTTPServer(buffer, certificateProviderFactory, authenticationProvider,
+                        httpRequestExceptionHandler, logHTTPService);
+            }
             pluginMetrics.gauge(SERVER_CONNECTIONS, server, Server::numConnections);
         }
 
@@ -127,6 +180,10 @@ public class HTTPSource implements Source<Record<Log>> {
     @Override
     public void stop() {
         if (server != null) {
+            requestAcknowledgementHandler.ifPresent(handler -> {
+                handler.prepareForShutdown();
+                handler.awaitPendingRequests(Duration.ofMillis(sourceConfig.getRequestTimeoutInMillis()));
+            });
             try {
                 server.stop().get();
             } catch (ExecutionException ex) {
