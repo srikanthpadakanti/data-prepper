@@ -68,6 +68,7 @@ import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -83,6 +84,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPOutputStream;
 
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.equalTo;
@@ -518,7 +520,7 @@ class HTTPSourceTest {
     }
 
     @Test
-    public void testHTTPJsonResponse429() throws InterruptedException {
+    public void testHTTPJsonResponse429() {
         // Prepare
         final int testMaxPendingRequests = 1;
         final int testThreadCount = 1;
@@ -560,22 +562,21 @@ class HTTPSourceTest {
         testWebClient.execute(testRequestHeaders, testHttpData).aggregate()
                 .whenComplete((i, ex) -> assertSecureResponseWithStatusCode(i, HttpStatus.TOO_MANY_REQUESTS)).join();
 
-        // Wait until source server timeout a request processing thread
-        Thread.sleep(serverTimeoutInMillis);
-        // New request should timeout instead of being rejected
+        final Measurement requestReceivedCount = MetricsTestUtil.getMeasurementFromList(
+                requestsReceivedMeasurements, Statistic.COUNT);
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertThat(requestReceivedCount.getValue(),
+                equalTo((double) (testMaxPendingRequests + testThreadCount + 1))));
         CompletionException actualException = assertThrows(
                 CompletionException.class, () -> testWebClient.execute(testRequestHeaders, testHttpData).aggregate().join());
         assertThat(actualException.getCause(), instanceOf(ResponseTimeoutException.class));
-        // verify metrics
-        final Measurement requestReceivedCount = MetricsTestUtil.getMeasurementFromList(
-                requestsReceivedMeasurements, Statistic.COUNT);
-        assertEquals(testMaxPendingRequests + testThreadCount + 2, requestReceivedCount.getValue());
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertThat(requestReceivedCount.getValue(),
+                equalTo((double) (testMaxPendingRequests + testThreadCount + 2))));
         final Measurement successRequestsCount = MetricsTestUtil.getMeasurementFromList(
                 successRequestsMeasurements, Statistic.COUNT);
-        assertEquals(1.0, successRequestsCount.getValue());
+        assertThat(successRequestsCount.getValue(), equalTo(1.0));
         final Measurement rejectedRequestsCount = MetricsTestUtil.getMeasurementFromList(
                 rejectedRequestsMeasurements, Statistic.COUNT);
-        assertEquals(1.0, rejectedRequestsCount.getValue());
+        assertThat(rejectedRequestsCount.getValue(), equalTo(1.0));
     }
 
     @Test
