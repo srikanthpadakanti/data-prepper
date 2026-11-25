@@ -1,0 +1,23 @@
+# Copyright OpenSearch Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The OpenSearch Contributors require contributions made to
+# this file be licensed under the Apache-2.0 license or a
+# compatible open source license.
+
+entry-pipeline:
+  source:
+    test_strict_acknowledgement_source:
+  sink:
+    - test_failure_handling_sink:
+        forward_to:
+          pipelines:
+            - "forwarded-pipeline"
+forwarded-pipeline:
+  processor:
+    - test_holding_events_processor:
+  sink:
+    - test_failure_handling_sink:
+dlq_pipeline:
+  sink:
+    - stdout:

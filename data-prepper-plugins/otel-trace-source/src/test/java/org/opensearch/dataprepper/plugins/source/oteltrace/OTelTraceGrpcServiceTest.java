@@ -33,8 +33,11 @@ import org.mockito.ArgumentMatchers;
 import org.mockito.Captor;
 import org.mockito.Mock;
 import org.mockito.MockedStatic;
+import org.mockito.InOrder;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.dataprepper.exceptions.BadRequestException;
+import org.opensearch.dataprepper.armeria.acknowledgements.PendingRequestAcknowledgement;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.exceptions.BufferWriteException;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.buffer.Buffer;
@@ -51,6 +54,8 @@ import io.micrometer.core.instrument.util.IOUtils;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.Collection;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.Collections;
 import java.util.List;
 import java.util.stream.Stream;
@@ -65,6 +70,9 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.never;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.times;
@@ -352,6 +360,49 @@ public class OTelTraceGrpcServiceTest {
         String file = IOUtils.toString(this.getClass().getResourceAsStream("/testjson/test-standard-trace.json"));
         String expected = String.format(file, TIME_KEY, END_TIME_KEY);
         JSONAssert.assertEquals(expected, result, false);
+    }
+
+    @Test
+    public void export_with_acknowledgements_responds_only_through_acknowledgement_handler() throws Exception {
+        final RequestAcknowledgementHandler requestAcknowledgementHandler = mock(RequestAcknowledgementHandler.class);
+        final PendingRequestAcknowledgement pendingAcknowledgement = mock(PendingRequestAcknowledgement.class);
+        final CompletableFuture<Void> acknowledged = new CompletableFuture<>();
+        when(requestAcknowledgementHandler.create(eq(serviceRequestContext), any())).thenReturn(pendingAcknowledgement);
+        when(pendingAcknowledgement.complete()).thenReturn(acknowledged);
+        objectUnderTest = new OTelTraceGrpcService(bufferWriteTimeoutInMillis, new OTelProtoOpensearchCodec.OTelProtoDecoder(), buffer,
+                mockPluginMetrics, null, Optional.of(requestAcknowledgementHandler));
+
+        try (MockedStatic<ServiceRequestContext> mockedStatic = mockStatic(ServiceRequestContext.class)) {
+            mockedStatic.when(ServiceRequestContext::current).thenReturn(serviceRequestContext);
+            objectUnderTest.export(SUCCESS_REQUEST, responseObserver);
+        }
+
+        final InOrder inOrder = inOrder(requestAcknowledgementHandler, buffer, pendingAcknowledgement);
+        inOrder.verify(requestAcknowledgementHandler).create(eq(serviceRequestContext), any());
+        inOrder.verify(buffer).writeAll(any(Collection.class), anyInt());
+        inOrder.verify(pendingAcknowledgement).complete();
+        inOrder.verify(requestAcknowledgementHandler).respondWhenAcknowledged(eq(acknowledged), eq(serviceRequestContext),
+                eq(responseObserver), any(ExportTraceServiceResponse.class), any(Runnable.class));
+        verifyNoInteractions(responseObserver);
+        verifyNoInteractions(successRequestsCounter);
+    }
+
+    @Test
+    public void export_with_acknowledgements_and_buffer_failure_does_not_complete_acknowledgement() throws Exception {
+        final RequestAcknowledgementHandler requestAcknowledgementHandler = mock(RequestAcknowledgementHandler.class);
+        final PendingRequestAcknowledgement pendingAcknowledgement = mock(PendingRequestAcknowledgement.class);
+        when(requestAcknowledgementHandler.create(eq(serviceRequestContext), any())).thenReturn(pendingAcknowledgement);
+        doThrow(new TimeoutException()).when(buffer).writeAll(any(Collection.class), anyInt());
+        objectUnderTest = new OTelTraceGrpcService(bufferWriteTimeoutInMillis, new OTelProtoOpensearchCodec.OTelProtoDecoder(), buffer,
+                mockPluginMetrics, null, Optional.of(requestAcknowledgementHandler));
+
+        try (MockedStatic<ServiceRequestContext> mockedStatic = mockStatic(ServiceRequestContext.class)) {
+            mockedStatic.when(ServiceRequestContext::current).thenReturn(serviceRequestContext);
+            assertThrows(BufferWriteException.class, () -> objectUnderTest.export(SUCCESS_REQUEST, responseObserver));
+        }
+
+        verify(pendingAcknowledgement, never()).complete();
+        verify(requestAcknowledgementHandler, never()).respondWhenAcknowledged(any(), any(), any(), any(), any());
     }
 
     private OTelTraceGrpcService generateOTelTraceGrpcService(final OTelProtoCodec.OTelProtoDecoder decoder) {

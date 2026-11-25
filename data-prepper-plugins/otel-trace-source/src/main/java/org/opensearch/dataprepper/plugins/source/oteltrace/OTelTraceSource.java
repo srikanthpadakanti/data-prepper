@@ -13,6 +13,8 @@ import com.linecorp.armeria.server.encoding.DecodingService;
 import com.linecorp.armeria.server.healthcheck.HealthCheckService;
 
 import org.opensearch.dataprepper.metrics.PluginMetrics;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
+import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPlugin;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPluginConstructor;
 import org.opensearch.dataprepper.model.buffer.Buffer;
@@ -37,6 +39,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 
 @DataPrepperPlugin(name = "otlp_traces",
@@ -54,25 +58,51 @@ public class OTelTraceSource implements Source<Record<Object>> {
     private final PluginFactory pluginFactory;
     private final CertificateProviderFactory certificateProviderFactory;
     private final String pipelineName;
+    private final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler;
     private Server server;
     private final ByteDecoder byteDecoder;
 
-    @DataPrepperPluginConstructor
     public OTelTraceSource(final OTelTraceSourceConfig oTelTraceSourceConfig, final PluginMetrics pluginMetrics, final PluginFactory pluginFactory,
                            final PipelineDescription pipelineDescription) {
-        this(oTelTraceSourceConfig, pluginMetrics, pluginFactory, new CertificateProviderFactory(oTelTraceSourceConfig), pipelineDescription);
+        this(oTelTraceSourceConfig, pluginMetrics, pluginFactory, pipelineDescription, null);
     }
 
-    // accessible only in the same package for unit test
+    @DataPrepperPluginConstructor
+    public OTelTraceSource(final OTelTraceSourceConfig oTelTraceSourceConfig, final PluginMetrics pluginMetrics, final PluginFactory pluginFactory,
+                           final PipelineDescription pipelineDescription, final AcknowledgementSetManager acknowledgementSetManager) {
+        this(oTelTraceSourceConfig, pluginMetrics, pluginFactory, new CertificateProviderFactory(oTelTraceSourceConfig), pipelineDescription,
+                acknowledgementSetManager);
+    }
+
     OTelTraceSource(final OTelTraceSourceConfig oTelTraceSourceConfig, final PluginMetrics pluginMetrics, final PluginFactory pluginFactory,
                     final CertificateProviderFactory certificateProviderFactory, final PipelineDescription pipelineDescription) {
+        this(oTelTraceSourceConfig, pluginMetrics, pluginFactory, certificateProviderFactory, pipelineDescription, null);
+    }
+
+    OTelTraceSource(final OTelTraceSourceConfig oTelTraceSourceConfig, final PluginMetrics pluginMetrics, final PluginFactory pluginFactory,
+                    final CertificateProviderFactory certificateProviderFactory, final PipelineDescription pipelineDescription,
+                    final AcknowledgementSetManager acknowledgementSetManager) {
         oTelTraceSourceConfig.validateAndInitializeCertAndKeyFileInS3();
+        this.requestAcknowledgementHandler = oTelTraceSourceConfig.isAcknowledgmentsEnabled()
+                ? Optional.of(new RequestAcknowledgementHandler(acknowledgementSetManager,
+                        Duration.ofMillis(oTelTraceSourceConfig.getRequestTimeoutInMillis()), pluginMetrics))
+                : Optional.empty();
         this.oTelTraceSourceConfig = oTelTraceSourceConfig;
         this.pluginMetrics = pluginMetrics;
         this.pluginFactory = pluginFactory;
         this.certificateProviderFactory = certificateProviderFactory;
         this.pipelineName = pipelineDescription.getPipelineName();
         this.byteDecoder = new OTelTraceDecoder(oTelTraceSourceConfig.getOutputFormat());
+    }
+
+    @Override
+    public boolean areAcknowledgementsEnabled() {
+        return oTelTraceSourceConfig.isAcknowledgmentsEnabled();
+    }
+
+    @Override
+    public boolean requiresStrictAcknowledgementValidation() {
+        return oTelTraceSourceConfig.isAcknowledgmentsEnabled();
     }
 
     @Override
@@ -133,7 +163,8 @@ public class OTelTraceSource implements Source<Record<Object>> {
     }
 
     private void configureGrpcService(ServerBuilder serverBuilder, final OTelProtoCodec.OTelProtoDecoder otelProtoDecoder, Buffer<Record<Object>> buffer) {
-        com.linecorp.armeria.server.grpc.GrpcService grpcService = new GrpcService(pluginFactory, otelProtoDecoder, oTelTraceSourceConfig, pluginMetrics, pipelineName).create(buffer, serverBuilder);
+        com.linecorp.armeria.server.grpc.GrpcService grpcService = new GrpcService(pluginFactory, otelProtoDecoder, oTelTraceSourceConfig, pluginMetrics, pipelineName).create(buffer, serverBuilder,
+                requestAcknowledgementHandler);
 
         if (CompressionOption.NONE.equals(oTelTraceSourceConfig.getCompression())) {
             serverBuilder.service(grpcService);
@@ -143,7 +174,8 @@ public class OTelTraceSource implements Source<Record<Object>> {
     }
 
     private void configureHttpService(ServerBuilder serverBuilder, final OTelProtoCodec.OTelProtoDecoder otelProtoDecoder, Buffer<Record<Object>> buffer) {
-        new HttpService(pluginMetrics, otelProtoDecoder, oTelTraceSourceConfig, pluginFactory).create(serverBuilder, buffer);
+        new HttpService(pluginMetrics, otelProtoDecoder, oTelTraceSourceConfig, pluginFactory).create(serverBuilder, buffer,
+                requestAcknowledgementHandler);
     }
 
     private void configureHeadersAndHealthCheck(ServerBuilder serverBuilder) {
@@ -192,6 +224,10 @@ public class OTelTraceSource implements Source<Record<Object>> {
     @Override
     public void stop() {
         if (server != null) {
+            requestAcknowledgementHandler.ifPresent(handler -> {
+                handler.prepareForShutdown();
+                handler.awaitPendingRequests(Duration.ofMillis(oTelTraceSourceConfig.getRequestTimeoutInMillis()));
+            });
             try {
                 server.stop().get();
             } catch (ExecutionException ex) {

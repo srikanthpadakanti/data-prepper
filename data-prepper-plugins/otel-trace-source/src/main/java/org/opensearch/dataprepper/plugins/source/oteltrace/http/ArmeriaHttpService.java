@@ -2,10 +2,17 @@ package org.opensearch.dataprepper.plugins.source.oteltrace.http;
 
 import java.time.Instant;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+import org.opensearch.dataprepper.armeria.acknowledgements.PendingRequestAcknowledgement;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.exceptions.BadRequestException;
 import org.opensearch.dataprepper.exceptions.BufferWriteException;
 import org.opensearch.dataprepper.logging.DataPrepperMarkers;
@@ -42,7 +49,10 @@ public class ArmeriaHttpService {
     private final OTelProtoCodec.OTelProtoDecoder oTelProtoDecoder;
     private final Buffer<Record<Object>> buffer;
 
+    private static final CompletableFuture<Void> COMPLETED = CompletableFuture.completedFuture(null);
+
     private final int bufferWriteTimeoutInMillis;
+    private final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler;
 
     private final Counter requestsReceivedCounter;
     private final Counter successRequestsCounter;
@@ -50,6 +60,15 @@ public class ArmeriaHttpService {
     private final Timer requestProcessDuration;
 
     public ArmeriaHttpService(Buffer<Record<Object>> buffer, final OTelProtoCodec.OTelProtoDecoder otelProtoDecoder, final PluginMetrics pluginMetrics, final int bufferWriteTimeoutInMillis) {
+        this(buffer, otelProtoDecoder, pluginMetrics, bufferWriteTimeoutInMillis, Optional.empty());
+    }
+
+    public ArmeriaHttpService(final Buffer<Record<Object>> buffer,
+                              final OTelProtoCodec.OTelProtoDecoder otelProtoDecoder,
+                              final PluginMetrics pluginMetrics,
+                              final int bufferWriteTimeoutInMillis,
+                              final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler) {
+        this.requestAcknowledgementHandler = Objects.requireNonNull(requestAcknowledgementHandler);
         this.buffer = buffer;
         this.oTelProtoDecoder = otelProtoDecoder;
         this.bufferWriteTimeoutInMillis = bufferWriteTimeoutInMillis;
@@ -63,16 +82,17 @@ public class ArmeriaHttpService {
     // todo make path configurable
     @Post("/opentelemetry.proto.collector.trace.v1.TraceService/Export")
     @Consumes(value = "application/json")
-    public ExportTraceServiceResponse exportTrace(ExportTraceServiceRequest request) {
+    public CompletableFuture<ExportTraceServiceResponse> exportTrace(ExportTraceServiceRequest request) {
         requestsReceivedCounter.increment();
         payloadSizeSummary.record(request.getSerializedSize());
 
-        requestProcessDuration.record(() -> processRequest(request));
+        final AtomicReference<CompletableFuture<Void>> acknowledged = new AtomicReference<>(COMPLETED);
+        requestProcessDuration.record(() -> acknowledged.set(processRequest(request)));
 
-        return ExportTraceServiceResponse.newBuilder().build();
+        return acknowledged.get().thenApply(ignored -> ExportTraceServiceResponse.newBuilder().build());
     }
 
-    private void processRequest(final ExportTraceServiceRequest request) {
+    private CompletableFuture<Void> processRequest(final ExportTraceServiceRequest request) {
         final Collection<Span> spans;
 
         try {
@@ -82,20 +102,28 @@ public class ArmeriaHttpService {
             throw new BadRequestException(e.getMessage(), e);
         }
 
+        final boolean byteBuffer = buffer.isByteBuffer();
+        final List<Record<Object>> records = byteBuffer
+                ? Collections.emptyList()
+                : spans.stream().map(span -> new Record<Object>(span)).collect(Collectors.toList());
+        final Optional<PendingRequestAcknowledgement> pendingAcknowledgement = byteBuffer
+                ? Optional.empty()
+                : requestAcknowledgementHandler.map(handler -> handler.create(ServiceRequestContext.current(), records));
+        final CompletableFuture<Void> acknowledged;
         try {
-            if (buffer.isByteBuffer()) {
+            if (byteBuffer) {
                 Map<String, ExportTraceServiceRequest> requestsMap = oTelProtoDecoder.splitExportTraceServiceRequestByTraceId(request);
                 for (Map.Entry<String, ExportTraceServiceRequest> entry: requestsMap.entrySet()) {
                     buffer.writeBytes(entry.getValue().toByteArray(), entry.getKey(), bufferWriteTimeoutInMillis);
                 }
             } else {
-                final List<Record<Object>> records = spans.stream().map(span -> new Record<Object>(span)).collect(Collectors.toList());
                 buffer.writeAll(records, bufferWriteTimeoutInMillis);
             }
+            acknowledged = pendingAcknowledgement.map(PendingRequestAcknowledgement::complete).orElse(null);
         } catch (final Exception e) {
             if (ServiceRequestContext.current().isTimedOut()) {
                 LOG.warn("Exception writing to buffer but request already timed out.", e);
-                return;
+                return COMPLETED;
             }
 
             LOG.error("Failed to write the request of size {} bytes due to:", request.getSerializedSize(), e);
@@ -104,9 +132,19 @@ public class ArmeriaHttpService {
 
         if (ServiceRequestContext.current().isTimedOut()) {
             LOG.warn("Buffer write completed successfully but request already timed out.");
-            return;
+            return COMPLETED;
+        }
+
+        if (acknowledged != null) {
+            final ServiceRequestContext requestContext = ServiceRequestContext.current();
+            return acknowledged.thenRun(() -> {
+                if (!requestContext.isTimedOut()) {
+                    successRequestsCounter.increment();
+                }
+            });
         }
 
         successRequestsCounter.increment();
+        return COMPLETED;
     }
 }

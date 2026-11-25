@@ -25,6 +25,7 @@ import org.opensearch.dataprepper.plugins.server.CreateServer.GRPCServiceConfig;
 import org.opensearch.dataprepper.plugins.server.ServerConfiguration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPlugin;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPluginConstructor;
 import org.opensearch.dataprepper.model.record.Record;
@@ -34,12 +35,15 @@ import org.opensearch.dataprepper.model.configuration.PluginModel;
 import org.opensearch.dataprepper.model.configuration.PluginSetting;
 import org.opensearch.dataprepper.model.metric.Metric;
 import org.opensearch.dataprepper.model.plugin.PluginFactory;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.armeria.authentication.GrpcAuthenticationProvider;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 
 @DataPrepperPlugin(name = "otlp", pluginType = Source.class, pluginConfigurationType = OTLPSourceConfig.class)
@@ -52,29 +56,60 @@ public class OTLPSource implements Source<Record<Object>> {
   private final PluginMetrics pluginMetrics;
   private final GrpcAuthenticationProvider authenticationProvider;
   private final CertificateProviderFactory certificateProviderFactory;
+  private final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler;
   private Server server;
+
+  public OTLPSource(final OTLPSourceConfig otlpSourceConfig,
+      final PluginMetrics pluginMetrics,
+      final PluginFactory pluginFactory,
+      final PipelineDescription pipelineDescription) {
+    this(otlpSourceConfig, pluginMetrics, pluginFactory, pipelineDescription, null);
+  }
 
   @DataPrepperPluginConstructor
   public OTLPSource(final OTLPSourceConfig otlpSourceConfig,
       final PluginMetrics pluginMetrics,
       final PluginFactory pluginFactory,
-      final PipelineDescription pipelineDescription) {
+      final PipelineDescription pipelineDescription,
+      final AcknowledgementSetManager acknowledgementSetManager) {
     this(otlpSourceConfig, pluginMetrics, pluginFactory,
-        new CertificateProviderFactory(otlpSourceConfig), pipelineDescription);
+        new CertificateProviderFactory(otlpSourceConfig), pipelineDescription, acknowledgementSetManager);
   }
 
-  // accessible only in the same package for unit test
   OTLPSource(final OTLPSourceConfig otlpSourceConfig,
       final PluginMetrics pluginMetrics,
       final PluginFactory pluginFactory,
       final CertificateProviderFactory certificateProviderFactory,
       final PipelineDescription pipelineDescription) {
+    this(otlpSourceConfig, pluginMetrics, pluginFactory, certificateProviderFactory, pipelineDescription, null);
+  }
+
+  OTLPSource(final OTLPSourceConfig otlpSourceConfig,
+      final PluginMetrics pluginMetrics,
+      final PluginFactory pluginFactory,
+      final CertificateProviderFactory certificateProviderFactory,
+      final PipelineDescription pipelineDescription,
+      final AcknowledgementSetManager acknowledgementSetManager) {
     otlpSourceConfig.validateAndInitializeCertAndKeyFileInS3();
+    this.requestAcknowledgementHandler = otlpSourceConfig.isAcknowledgmentsEnabled()
+        ? Optional.of(new RequestAcknowledgementHandler(acknowledgementSetManager,
+            Duration.ofMillis(otlpSourceConfig.getRequestTimeoutInMillis()), pluginMetrics))
+        : Optional.empty();
     this.otlpSourceConfig = otlpSourceConfig;
     this.pluginMetrics = pluginMetrics;
     this.certificateProviderFactory = certificateProviderFactory;
     this.pipelineName = pipelineDescription.getPipelineName();
     this.authenticationProvider = createAuthenticationProvider(pluginFactory);
+  }
+
+  @Override
+  public boolean areAcknowledgementsEnabled() {
+    return otlpSourceConfig.isAcknowledgmentsEnabled();
+  }
+
+  @Override
+  public boolean requiresStrictAcknowledgementValidation() {
+    return otlpSourceConfig.isAcknowledgmentsEnabled();
   }
 
   @Override
@@ -90,17 +125,17 @@ public class OTLPSource implements Source<Record<Object>> {
       final OTelLogsGrpcService oTelLogsGrpcService = new OTelLogsGrpcService(
           (int) (otlpSourceConfig.getRequestTimeoutInMillis() * 0.8),
           otlpSourceConfig.getLogsOutputFormat() == OTelOutputFormat.OPENSEARCH ? new OTelProtoOpensearchCodec.OTelProtoDecoder() : new OTelProtoStandardCodec.OTelProtoDecoder(),
-          buffer, pluginMetrics, "otlp.logs");
+          buffer, pluginMetrics, "otlp.logs", requestAcknowledgementHandler);
 
       final OTelMetricsGrpcService oTelMetricsGrpcService = new OTelMetricsGrpcService(
           (int) (otlpSourceConfig.getRequestTimeoutInMillis() * 0.8),
           otlpSourceConfig.getMetricsOutputFormat() == OTelOutputFormat.OPENSEARCH ? new OTelProtoOpensearchCodec.OTelProtoDecoder() : new OTelProtoStandardCodec.OTelProtoDecoder(),
-          metricBuffer, null, pluginMetrics, "otlp.metrics");
+          metricBuffer, null, pluginMetrics, "otlp.metrics", requestAcknowledgementHandler);
 
       final OTelTraceGrpcService oTelTraceGrpcService = new OTelTraceGrpcService(
           (int) (otlpSourceConfig.getRequestTimeoutInMillis() * 0.8),
           otlpSourceConfig.getTracesOutputFormat() == OTelOutputFormat.OPENSEARCH ? new OTelProtoOpensearchCodec.OTelProtoDecoder() : new OTelProtoStandardCodec.OTelProtoDecoder(),
-          buffer, pluginMetrics, "otlp.traces");
+          buffer, pluginMetrics, "otlp.traces", requestAcknowledgementHandler);
 
       ServerConfiguration serverConfiguration = ConvertConfiguration.convertConfiguration(otlpSourceConfig);
       CreateServer createServer = new CreateServer(serverConfiguration, LOG, pluginMetrics, "otlp", pipelineName);
@@ -140,6 +175,10 @@ public class OTLPSource implements Source<Record<Object>> {
   @Override
   public void stop() {
     if (server != null) {
+      requestAcknowledgementHandler.ifPresent(handler -> {
+        handler.prepareForShutdown();
+        handler.awaitPendingRequests(Duration.ofMillis(otlpSourceConfig.getRequestTimeoutInMillis()));
+      });
       try {
         server.stop().get();
       } catch (ExecutionException ex) {

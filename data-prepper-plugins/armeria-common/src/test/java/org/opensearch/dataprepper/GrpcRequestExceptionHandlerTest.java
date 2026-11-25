@@ -19,6 +19,8 @@ import io.micrometer.core.instrument.Counter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatchers;
 import org.mockito.Captor;
@@ -26,7 +28,9 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.dataprepper.exceptions.BadRequestException;
 import org.opensearch.dataprepper.exceptions.BufferWriteException;
+import org.opensearch.dataprepper.exceptions.NegativeAcknowledgementException;
 import org.opensearch.dataprepper.exceptions.RequestCancelledException;
+import org.opensearch.dataprepper.exceptions.SourceShuttingDownException;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.buffer.SizeOverflowException;
 
@@ -35,12 +39,15 @@ import java.time.Duration;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
+import java.util.stream.Stream;
 
 import static com.linecorp.armeria.internal.common.grpc.MetadataUtil.GRPC_STATUS_DETAILS_BIN_KEY;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.opensearch.dataprepper.GrpcRequestExceptionHandler.ARMERIA_REQUEST_TIMEOUT_MESSAGE;
@@ -121,6 +128,26 @@ public class GrpcRequestExceptionHandlerTest {
             Optional<Any> retryInfo = currentStatus.getDetailsList().stream().filter(d -> d.is(RetryInfo.class)).findFirst();
             assertTrue(retryInfo.isPresent(), "No RetryInfo at status:\n" + currentStatus.toString());
         }
+    }
+
+    private static Stream<Function<String, RuntimeException>> retryableAcknowledgementExceptions() {
+        return Stream.of(NegativeAcknowledgementException::new, SourceShuttingDownException::new);
+    }
+
+    @ParameterizedTest
+    @MethodSource("retryableAcknowledgementExceptions")
+    public void apply_with_acknowledgement_exception_returns_unavailable_with_retry_info(
+            final Function<String, RuntimeException> exceptionFactory) {
+        final String exceptionMessage = UUID.randomUUID().toString();
+
+        final Status status = grpcRequestExceptionHandler.apply(requestContext, Status.UNKNOWN,
+                exceptionFactory.apply(exceptionMessage), metadata);
+
+        assertThat(status.getCode(), equalTo(Status.Code.UNAVAILABLE));
+        assertThat(status.getDescription(), equalTo(exceptionMessage));
+        verify(metadata).put(ArgumentMatchers.eq(GRPC_STATUS_DETAILS_BIN_KEY), this.status.capture());
+        assertThat(this.status.getValue().getDetailsList().stream().anyMatch(detail -> detail.is(RetryInfo.class)), equalTo(true));
+        verifyNoInteractions(internalServerErrorCounter);
     }
 
     @Test

@@ -14,6 +14,8 @@ import io.micrometer.core.instrument.Timer;
 import io.opentelemetry.proto.collector.logs.v1.ExportLogsServiceRequest;
 import io.opentelemetry.proto.collector.logs.v1.ExportLogsServiceResponse;
 import io.opentelemetry.proto.collector.logs.v1.LogsServiceGrpc;
+import org.opensearch.dataprepper.armeria.acknowledgements.PendingRequestAcknowledgement;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.exceptions.BadRequestException;
 import org.opensearch.dataprepper.exceptions.BufferWriteException;
 import org.opensearch.dataprepper.exceptions.RequestCancelledException;
@@ -28,7 +30,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
+import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -42,6 +48,7 @@ public class OTelLogsGrpcService extends LogsServiceGrpc.LogsServiceImplBase {
     public static final String REQUEST_PARSING_DURATION = "requestParsingDuration";
 
     private final int bufferWriteTimeoutInMillis;
+    private final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler;
 
     private final OTelProtoCodec.OTelProtoDecoder oTelProtoDecoder;
 
@@ -59,6 +66,16 @@ public class OTelLogsGrpcService extends LogsServiceGrpc.LogsServiceImplBase {
                                final Buffer<Record<Object>> buffer,
                                final PluginMetrics pluginMetrics,
                                final String metricsPrefix) {
+        this(bufferWriteTimeoutInMillis, oTelProtoDecoder, buffer, pluginMetrics, metricsPrefix, Optional.empty());
+    }
+
+    public OTelLogsGrpcService(int bufferWriteTimeoutInMillis,
+                               final OTelProtoCodec.OTelProtoDecoder oTelProtoDecoder,
+                               final Buffer<Record<Object>> buffer,
+                               final PluginMetrics pluginMetrics,
+                               final String metricsPrefix,
+                               final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler) {
+        this.requestAcknowledgementHandler = Objects.requireNonNull(requestAcknowledgementHandler);
         this.bufferWriteTimeoutInMillis = bufferWriteTimeoutInMillis;
         this.buffer = buffer;
 
@@ -111,13 +128,22 @@ public class OTelLogsGrpcService extends LogsServiceGrpc.LogsServiceImplBase {
             throw new BadRequestException(e.getMessage(), e);
         }
 
+        final ServiceRequestContext requestContext = ServiceRequestContext.current();
+        final boolean byteBuffer = buffer.isByteBuffer();
+        final List<Record<Object>> records = byteBuffer
+                ? Collections.emptyList()
+                : logs.stream().map(log -> new Record<Object>(log)).collect(Collectors.toList());
+        final Optional<PendingRequestAcknowledgement> pendingAcknowledgement = byteBuffer
+                ? Optional.empty()
+                : requestAcknowledgementHandler.map(handler -> handler.create(requestContext, records));
+        final CompletableFuture<Void> acknowledged;
         try {
-            if (buffer.isByteBuffer()) {
+            if (byteBuffer) {
                 buffer.writeBytes(request.toByteArray(), null, bufferWriteTimeoutInMillis);
             } else {
-                final List<Record<Object>> records = logs.stream().map(log -> new Record<Object>(log)).collect(Collectors.toList());
                 buffer.writeAll(records, bufferWriteTimeoutInMillis);
             }
+            acknowledged = pendingAcknowledgement.map(PendingRequestAcknowledgement::complete).orElse(null);
         } catch (Exception e) {
             if (ServiceRequestContext.current().isTimedOut()) {
                 LOG.warn("Exception writing to buffer but request already timed out.", e);
@@ -130,6 +156,12 @@ public class OTelLogsGrpcService extends LogsServiceGrpc.LogsServiceImplBase {
 
         if (ServiceRequestContext.current().isTimedOut()) {
             LOG.warn("Buffer write completed successfully but request already timed out.");
+            return;
+        }
+
+        if (acknowledged != null) {
+            requestAcknowledgementHandler.get().respondWhenAcknowledged(acknowledged, requestContext, responseObserver,
+                    ExportLogsServiceResponse.newBuilder().build(), successRequestsCounter::increment);
             return;
         }
 

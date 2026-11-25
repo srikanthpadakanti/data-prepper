@@ -14,6 +14,8 @@ import io.micrometer.core.instrument.Timer;
 import io.opentelemetry.proto.collector.trace.v1.ExportTraceServiceRequest;
 import io.opentelemetry.proto.collector.trace.v1.ExportTraceServiceResponse;
 import io.opentelemetry.proto.collector.trace.v1.TraceServiceGrpc;
+import org.opensearch.dataprepper.armeria.acknowledgements.PendingRequestAcknowledgement;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.exceptions.BadRequestException;
 import org.opensearch.dataprepper.exceptions.BufferWriteException;
 import org.opensearch.dataprepper.exceptions.RequestCancelledException;
@@ -28,8 +30,12 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 public class OTelTraceGrpcService extends TraceServiceGrpc.TraceServiceImplBase {
@@ -45,6 +51,7 @@ public class OTelTraceGrpcService extends TraceServiceGrpc.TraceServiceImplBase 
     public static final String REQUEST_PROCESS_DURATION = "requestProcessDuration";
 
     private final int bufferWriteTimeoutInMillis;
+    private final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler;
     private final OTelProtoCodec.OTelProtoDecoder oTelProtoDecoder;
     private final Buffer<Record<Object>> buffer;
 
@@ -59,6 +66,16 @@ public class OTelTraceGrpcService extends TraceServiceGrpc.TraceServiceImplBase 
                                 final Buffer<Record<Object>> buffer,
                                 final PluginMetrics pluginMetrics,
                                 final String metricsPrefix) {
+        this(bufferWriteTimeoutInMillis, oTelProtoDecoder, buffer, pluginMetrics, metricsPrefix, Optional.empty());
+    }
+
+    public OTelTraceGrpcService(int bufferWriteTimeoutInMillis,
+                                final OTelProtoCodec.OTelProtoDecoder oTelProtoDecoder,
+                                final Buffer<Record<Object>> buffer,
+                                final PluginMetrics pluginMetrics,
+                                final String metricsPrefix,
+                                final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler) {
+        this.requestAcknowledgementHandler = Objects.requireNonNull(requestAcknowledgementHandler);
         this.bufferWriteTimeoutInMillis = bufferWriteTimeoutInMillis;
         this.buffer = buffer;
 
@@ -104,16 +121,25 @@ public class OTelTraceGrpcService extends TraceServiceGrpc.TraceServiceImplBase 
             throw new BadRequestException(e.getMessage(), e);
         }
 
+        final ServiceRequestContext requestContext = ServiceRequestContext.current();
+        final boolean byteBuffer = buffer.isByteBuffer();
+        final List<Record<Object>> records = byteBuffer
+                ? Collections.emptyList()
+                : spans.stream().map(span -> new Record<Object>(span)).collect(Collectors.toList());
+        final Optional<PendingRequestAcknowledgement> pendingAcknowledgement = byteBuffer
+                ? Optional.empty()
+                : requestAcknowledgementHandler.map(handler -> handler.create(requestContext, records));
+        final CompletableFuture<Void> acknowledged;
         try {
-            if (buffer.isByteBuffer()) {
+            if (byteBuffer) {
                 Map<String, ExportTraceServiceRequest> requestsMap = oTelProtoDecoder.splitExportTraceServiceRequestByTraceId(request);
                 for (Map.Entry<String, ExportTraceServiceRequest> entry: requestsMap.entrySet()) {
                     buffer.writeBytes(entry.getValue().toByteArray(), entry.getKey(), bufferWriteTimeoutInMillis);
                 }
             } else {
-                final List<Record<Object>> records = spans.stream().map(span -> new Record<Object>(span)).collect(Collectors.toList());
                 buffer.writeAll(records, bufferWriteTimeoutInMillis);
             }
+            acknowledged = pendingAcknowledgement.map(PendingRequestAcknowledgement::complete).orElse(null);
         } catch (final Exception e) {
             if (ServiceRequestContext.current().isTimedOut()) {
                 LOG.warn("Exception writing to buffer but request already timed out.", e);
@@ -126,6 +152,12 @@ public class OTelTraceGrpcService extends TraceServiceGrpc.TraceServiceImplBase 
 
         if (ServiceRequestContext.current().isTimedOut()) {
             LOG.warn("Buffer write completed successfully but request already timed out.");
+            return;
+        }
+
+        if (acknowledged != null) {
+            requestAcknowledgementHandler.get().respondWhenAcknowledged(acknowledged, requestContext, responseObserver,
+                    ExportTraceServiceResponse.newBuilder().build(), successRequestsCounter::increment);
             return;
         }
 

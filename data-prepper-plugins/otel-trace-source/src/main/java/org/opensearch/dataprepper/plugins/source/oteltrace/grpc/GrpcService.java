@@ -7,6 +7,7 @@ import java.util.Optional;
 import java.util.function.Function;
 
 import org.opensearch.dataprepper.GrpcRequestExceptionHandler;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.armeria.authentication.GrpcAuthenticationProvider;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.buffer.Buffer;
@@ -59,13 +60,20 @@ public class GrpcService {
     }
 
     public com.linecorp.armeria.server.grpc.GrpcService create(Buffer<Record<Object>> buffer, ServerBuilder serverBuilder) {
+        return create(buffer, serverBuilder, Optional.empty());
+    }
+
+    public com.linecorp.armeria.server.grpc.GrpcService create(final Buffer<Record<Object>> buffer,
+                                                               final ServerBuilder serverBuilder,
+                                                               final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler) {
 
         final OTelTraceGrpcService oTelTraceGrpcService = new OTelTraceGrpcService(
                 (int)(oTelTraceSourceConfig.getRequestTimeoutInMillis() * 0.8),
                 otelProtoDecoder,
                 buffer,
                 pluginMetrics,
-                null
+                null,
+                requestAcknowledgementHandler
         );
 
         final List<ServerInterceptor> serverInterceptors = getAuthenticationInterceptor();

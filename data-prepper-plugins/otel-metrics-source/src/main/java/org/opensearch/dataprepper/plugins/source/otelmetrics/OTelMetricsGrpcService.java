@@ -14,7 +14,10 @@ import io.micrometer.core.instrument.Timer;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceResponse;
 import io.opentelemetry.proto.collector.metrics.v1.MetricsServiceGrpc;
+import org.opensearch.dataprepper.armeria.acknowledgements.PendingRequestAcknowledgement;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.exceptions.BufferWriteException;
+import org.opensearch.dataprepper.exceptions.SourceShuttingDownException;
 import org.opensearch.dataprepper.exceptions.RequestCancelledException;
 import static org.opensearch.dataprepper.plugins.otel.codec.OTelProtoCodec.DEFAULT_EXPONENTIAL_HISTOGRAM_MAX_ALLOWED_SCALE;
 import org.opensearch.dataprepper.plugins.otel.codec.OTelProtoCodec;
@@ -28,7 +31,10 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class OTelMetricsGrpcService extends MetricsServiceGrpc.MetricsServiceImplBase {
@@ -42,6 +48,7 @@ public class OTelMetricsGrpcService extends MetricsServiceGrpc.MetricsServiceImp
     public static final String REQUEST_PROCESS_DURATION = "requestProcessDuration";
 
     private final int bufferWriteTimeoutInMillis;
+    private final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler;
     private final OTelProtoCodec.OTelProtoDecoder oTelProtoDecoder;
     private final Buffer<Record<? extends Metric>> buffer;
 
@@ -59,6 +66,17 @@ public class OTelMetricsGrpcService extends MetricsServiceGrpc.MetricsServiceImp
                                   final Set<String> bufferPartitionKeys,
                                   final PluginMetrics pluginMetrics,
                                   final String metricsPrefix) {
+        this(bufferWriteTimeoutInMillis, oTelProtoDecoder, buffer, bufferPartitionKeys, pluginMetrics, metricsPrefix, Optional.empty());
+    }
+
+    public OTelMetricsGrpcService(int bufferWriteTimeoutInMillis,
+                                  final OTelProtoCodec.OTelProtoDecoder oTelProtoDecoder,
+                                  Buffer<Record<? extends Metric>> buffer,
+                                  final Set<String> bufferPartitionKeys,
+                                  final PluginMetrics pluginMetrics,
+                                  final String metricsPrefix,
+                                  final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler) {
+        this.requestAcknowledgementHandler = Objects.requireNonNull(requestAcknowledgementHandler);
         this.bufferWriteTimeoutInMillis = bufferWriteTimeoutInMillis;
         this.buffer = buffer;
 
@@ -99,6 +117,8 @@ public class OTelMetricsGrpcService extends MetricsServiceGrpc.MetricsServiceImp
     }
 
     private void processRequest(final ExportMetricsServiceRequest request, final StreamObserver<ExportMetricsServiceResponse> responseObserver) {
+        final ServiceRequestContext requestContext = ServiceRequestContext.current();
+        CompletableFuture<Void> acknowledged = null;
         try {
             if (buffer.isByteBuffer()) {
                 if (bufferPartitionKeys != null && !bufferPartitionKeys.isEmpty()) {
@@ -115,10 +135,15 @@ public class OTelMetricsGrpcService extends MetricsServiceGrpc.MetricsServiceImp
 
                 AtomicInteger droppedCounter = new AtomicInteger(0);
                 metrics = oTelProtoDecoder.parseExportMetricsServiceRequest(request, droppedCounter, DEFAULT_EXPONENTIAL_HISTOGRAM_MAX_ALLOWED_SCALE, Instant.now(), true, true, true);
+                final Optional<PendingRequestAcknowledgement> pendingAcknowledgement =
+                        requestAcknowledgementHandler.map(handler -> handler.create(requestContext, metrics));
                 recordsDroppedCounter.increment(droppedCounter.get());
                 recordsCreatedCounter.increment(metrics.size());
                 buffer.writeAll(metrics, bufferWriteTimeoutInMillis);
+                acknowledged = pendingAcknowledgement.map(PendingRequestAcknowledgement::complete).orElse(null);
             }
+        } catch (final SourceShuttingDownException e) {
+            throw e;
         } catch (Exception e) {
             if (ServiceRequestContext.current().isTimedOut()) {
                 LOG.warn("Exception writing to buffer but request already timed out.", e);
@@ -131,6 +156,12 @@ public class OTelMetricsGrpcService extends MetricsServiceGrpc.MetricsServiceImp
 
         if (ServiceRequestContext.current().isTimedOut()) {
             LOG.warn("Buffer write completed successfully but request already timed out.");
+            return;
+        }
+
+        if (acknowledged != null) {
+            requestAcknowledgementHandler.get().respondWhenAcknowledged(acknowledged, requestContext, responseObserver,
+                    ExportMetricsServiceResponse.newBuilder().build(), successRequestsCounter::increment);
             return;
         }
 

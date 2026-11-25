@@ -74,4 +74,18 @@ public class AcknowledgementSetMonitorTests {
         acknowledgementSetMonitor.run();
         assertThat(acknowledgementSetMonitor.getSize(), equalTo(1));
     }
+
+    @Test
+    public void run_when_caller_is_interrupted_keeps_interrupt_status() {
+        acknowledgementSetMonitor.add(acknowledgementSet1);
+
+        Thread.currentThread().interrupt();
+        try {
+            acknowledgementSetMonitor.run();
+
+            assertThat(Thread.currentThread().isInterrupted(), equalTo(true));
+        } finally {
+            Thread.interrupted();
+        }
+    }
 }

@@ -21,7 +21,9 @@ import io.micrometer.core.instrument.Counter;
 
 import org.opensearch.dataprepper.exceptions.BadRequestException;
 import org.opensearch.dataprepper.exceptions.BufferWriteException;
+import org.opensearch.dataprepper.exceptions.NegativeAcknowledgementException;
 import org.opensearch.dataprepper.exceptions.RequestCancelledException;
+import org.opensearch.dataprepper.exceptions.SourceShuttingDownException;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.buffer.SizeOverflowException;
 import org.slf4j.Logger;
@@ -92,6 +94,8 @@ public class GrpcRequestExceptionHandler implements GoogleGrpcExceptionHandlerFu
         } else if (e instanceof RequestCancelledException) {
             requestTimeoutsCounter.increment();
             return createStatus(e, Status.Code.CANCELLED);
+        } else if (e instanceof NegativeAcknowledgementException || e instanceof SourceShuttingDownException) {
+            return createStatus(e, Status.Code.UNAVAILABLE);
         }
 
         internalServerErrorCounter.increment();
@@ -113,7 +117,7 @@ public class GrpcRequestExceptionHandler implements GoogleGrpcExceptionHandlerFu
         com.google.rpc.Status.Builder builder = com.google.rpc.Status.newBuilder()
                 .setCode(code.value())
                 .setMessage(message);
-        if (code == Status.Code.RESOURCE_EXHAUSTED) {
+        if (code == Status.Code.RESOURCE_EXHAUSTED || code == Status.Code.UNAVAILABLE) {
             builder.addDetails(Any.pack(retryInfoCalculator.createRetryInfo()));
         }
         return builder.build();

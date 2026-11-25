@@ -4,7 +4,9 @@ import static org.opensearch.dataprepper.armeria.authentication.ArmeriaHttpAuthe
 
 import java.time.Duration;
 import java.util.Map;
+import java.util.Optional;
 
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.armeria.authentication.ArmeriaHttpAuthenticationProvider;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.buffer.Buffer;
@@ -39,10 +41,17 @@ public class HttpService {
     }
 
     public ArmeriaHttpService create(ServerBuilder serverBuilder, Buffer<Record<Object>> buffer) {
+        return create(serverBuilder, buffer, Optional.empty());
+    }
+
+    public ArmeriaHttpService create(final ServerBuilder serverBuilder,
+                                     final Buffer<Record<Object>> buffer,
+                                     final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler) {
         RetryInfoConfig retryInfo = oTelTraceSourceConfig.getRetryInfo() != null
                 ? oTelTraceSourceConfig.getRetryInfo()
                 : DEFAULT_RETRY_INFO;
-        ArmeriaHttpService httpService = new ArmeriaHttpService(buffer, otelProtoDecoder, pluginMetrics, oTelTraceSourceConfig.getRequestTimeoutInMillis());
+        ArmeriaHttpService httpService = new ArmeriaHttpService(buffer, otelProtoDecoder, pluginMetrics,
+                oTelTraceSourceConfig.getRequestTimeoutInMillis(), requestAcknowledgementHandler);
         HttpExceptionHandler httpExceptionHandler = new HttpExceptionHandler(pluginMetrics, retryInfo.getMinDelay(), retryInfo.getMaxDelay());
 
         configureAuthentication(serverBuilder);

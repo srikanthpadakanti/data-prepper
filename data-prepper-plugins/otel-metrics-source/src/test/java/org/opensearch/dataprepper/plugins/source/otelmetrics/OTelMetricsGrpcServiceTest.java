@@ -14,6 +14,8 @@ import io.micrometer.core.instrument.Timer;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceResponse;
 import org.opensearch.dataprepper.plugins.otel.codec.OTelProtoCodec;
+import org.opensearch.dataprepper.armeria.acknowledgements.PendingRequestAcknowledgement;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.plugins.otel.codec.OTelProtoOpensearchCodec;
 import org.opensearch.dataprepper.plugins.otel.codec.OTelProtoStandardCodec;
 import io.opentelemetry.proto.metrics.v1.Metric;
@@ -29,8 +31,10 @@ import org.mockito.ArgumentMatchers;
 import org.mockito.Captor;
 import org.mockito.Mock;
 import org.mockito.MockedStatic;
+import org.mockito.InOrder;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.dataprepper.exceptions.BufferWriteException;
+import org.opensearch.dataprepper.exceptions.SourceShuttingDownException;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.buffer.Buffer;
 import org.opensearch.dataprepper.model.configuration.PluginSetting;
@@ -42,10 +46,13 @@ import io.micrometer.core.instrument.util.IOUtils;
 
 import java.time.Instant;
 import java.util.Collection;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Stream;
 
@@ -59,6 +66,8 @@ import static org.hamcrest.Matchers.hasEntry;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.times;
@@ -203,6 +212,67 @@ public class OTelMetricsGrpcServiceTest {
 
         when(serviceRequestContext.isTimedOut()).thenReturn(false);
 
+    }
+
+    @Test
+    public void export_with_acknowledgements_responds_only_through_acknowledgement_handler() throws Exception {
+        final RequestAcknowledgementHandler requestAcknowledgementHandler = mock(RequestAcknowledgementHandler.class);
+        final PendingRequestAcknowledgement pendingAcknowledgement = mock(PendingRequestAcknowledgement.class);
+        final CompletableFuture<Void> acknowledged = new CompletableFuture<>();
+        when(requestAcknowledgementHandler.create(eq(serviceRequestContext), any())).thenReturn(pendingAcknowledgement);
+        when(pendingAcknowledgement.complete()).thenReturn(acknowledged);
+        sut = new OTelMetricsGrpcService(bufferWriteTimeoutInMillis, new OTelProtoOpensearchCodec.OTelProtoDecoder(), buffer,
+                null, mockPluginMetrics, null, Optional.of(requestAcknowledgementHandler));
+
+        try (MockedStatic<ServiceRequestContext> mockedStatic = mockStatic(ServiceRequestContext.class)) {
+            mockedStatic.when(ServiceRequestContext::current).thenReturn(serviceRequestContext);
+            sut.export(METRICS_REQUEST, responseObserver);
+        }
+
+        final InOrder inOrder = inOrder(requestAcknowledgementHandler, buffer, pendingAcknowledgement);
+        inOrder.verify(requestAcknowledgementHandler).create(eq(serviceRequestContext), any());
+        inOrder.verify(buffer).writeAll(any(Collection.class), anyInt());
+        inOrder.verify(pendingAcknowledgement).complete();
+        inOrder.verify(requestAcknowledgementHandler).respondWhenAcknowledged(eq(acknowledged), eq(serviceRequestContext),
+                eq(responseObserver), any(ExportMetricsServiceResponse.class), any(Runnable.class));
+        verifyNoInteractions(responseObserver);
+        verifyNoInteractions(successRequestsCounter);
+    }
+
+    @Test
+    public void export_with_acknowledgements_and_buffer_failure_does_not_complete_acknowledgement() throws Exception {
+        final RequestAcknowledgementHandler requestAcknowledgementHandler = mock(RequestAcknowledgementHandler.class);
+        final PendingRequestAcknowledgement pendingAcknowledgement = mock(PendingRequestAcknowledgement.class);
+        when(requestAcknowledgementHandler.create(eq(serviceRequestContext), any())).thenReturn(pendingAcknowledgement);
+        doThrow(new TimeoutException()).when(buffer).writeAll(any(Collection.class), anyInt());
+        sut = new OTelMetricsGrpcService(bufferWriteTimeoutInMillis, new OTelProtoOpensearchCodec.OTelProtoDecoder(), buffer,
+                null, mockPluginMetrics, null, Optional.of(requestAcknowledgementHandler));
+
+        try (MockedStatic<ServiceRequestContext> mockedStatic = mockStatic(ServiceRequestContext.class)) {
+            mockedStatic.when(ServiceRequestContext::current).thenReturn(serviceRequestContext);
+            assertThrows(BufferWriteException.class, () -> sut.export(METRICS_REQUEST, responseObserver));
+        }
+
+        verify(pendingAcknowledgement, never()).complete();
+        verify(requestAcknowledgementHandler, never()).respondWhenAcknowledged(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    public void export_with_acknowledgements_when_shutting_down_throws_SourceShuttingDownException_without_writing() throws Exception {
+        final RequestAcknowledgementHandler requestAcknowledgementHandler = mock(RequestAcknowledgementHandler.class);
+        when(requestAcknowledgementHandler.create(eq(serviceRequestContext), any()))
+                .thenThrow(new SourceShuttingDownException(UUID.randomUUID().toString()));
+        sut = new OTelMetricsGrpcService(bufferWriteTimeoutInMillis, new OTelProtoOpensearchCodec.OTelProtoDecoder(), buffer,
+                null, mockPluginMetrics, null, Optional.of(requestAcknowledgementHandler));
+
+        try (MockedStatic<ServiceRequestContext> mockedStatic = mockStatic(ServiceRequestContext.class)) {
+            mockedStatic.when(ServiceRequestContext::current).thenReturn(serviceRequestContext);
+            assertThrows(SourceShuttingDownException.class, () -> sut.export(METRICS_REQUEST, responseObserver));
+        }
+
+        verify(buffer, never()).writeAll(any(Collection.class), anyInt());
+        verifyNoInteractions(createdCounter);
+        verifyNoInteractions(responseObserver);
     }
 
     OTelMetricsGrpcService createObjectUnderTestWithKeys(final OTelProtoCodec.OTelProtoDecoder decoder, final Set<String> keys) {

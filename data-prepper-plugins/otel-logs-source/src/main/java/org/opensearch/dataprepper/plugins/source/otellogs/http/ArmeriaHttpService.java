@@ -11,9 +11,16 @@
 package org.opensearch.dataprepper.plugins.source.otellogs.http;
 
 import java.time.Instant;
+import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+import org.opensearch.dataprepper.armeria.acknowledgements.PendingRequestAcknowledgement;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.exceptions.BadRequestException;
 import org.opensearch.dataprepper.exceptions.BufferWriteException;
 import org.opensearch.dataprepper.logging.DataPrepperMarkers;
@@ -47,7 +54,10 @@ public class ArmeriaHttpService {
     private final OTelProtoCodec.OTelProtoDecoder oTelProtoDecoder;
     private final Buffer<Record<Object>> buffer;
 
+    private static final CompletableFuture<Void> COMPLETED = CompletableFuture.completedFuture(null);
+
     private final int bufferWriteTimeoutInMillis;
+    private final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler;
 
     private final Counter requestsReceivedCounter;
     private final Counter successRequestsCounter;
@@ -60,6 +70,17 @@ public class ArmeriaHttpService {
             final int bufferWriteTimeoutInMillis,
             final OTelProtoCodec.OTelProtoDecoder oTelProtoDecoder
     ) {
+        this(buffer, pluginMetrics, bufferWriteTimeoutInMillis, oTelProtoDecoder, Optional.empty());
+    }
+
+    public ArmeriaHttpService(
+            Buffer<Record<Object>> buffer,
+            final PluginMetrics pluginMetrics,
+            final int bufferWriteTimeoutInMillis,
+            final OTelProtoCodec.OTelProtoDecoder oTelProtoDecoder,
+            final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler
+    ) {
+        this.requestAcknowledgementHandler = Objects.requireNonNull(requestAcknowledgementHandler);
         this.buffer = buffer;
         this.oTelProtoDecoder = oTelProtoDecoder;
         this.bufferWriteTimeoutInMillis = bufferWriteTimeoutInMillis;
@@ -74,16 +95,17 @@ public class ArmeriaHttpService {
     @Post("")
     @ConsumesJson
     @ConsumesProtobuf
-    public ExportLogsServiceResponse exportLog(ExportLogsServiceRequest request) {
+    public CompletableFuture<ExportLogsServiceResponse> exportLog(ExportLogsServiceRequest request) {
         requestsReceivedCounter.increment();
         payloadSizeSummary.record(request.getSerializedSize());
 
-        requestProcessDuration.record(() -> processRequest(request));
+        final AtomicReference<CompletableFuture<Void>> acknowledged = new AtomicReference<>(COMPLETED);
+        requestProcessDuration.record(() -> acknowledged.set(processRequest(request)));
 
-        return ExportLogsServiceResponse.newBuilder().build();
+        return acknowledged.get().thenApply(ignored -> ExportLogsServiceResponse.newBuilder().build());
     }
 
-    private void processRequest(final ExportLogsServiceRequest request) {
+    private CompletableFuture<Void> processRequest(final ExportLogsServiceRequest request) {
         final List<OpenTelemetryLog> logs;
 
         try {
@@ -93,17 +115,25 @@ public class ArmeriaHttpService {
             throw new BadRequestException(e.getMessage(), e);
         }
 
+        final boolean byteBuffer = buffer.isByteBuffer();
+        final List<Record<Object>> records = byteBuffer
+                ? Collections.emptyList()
+                : logs.stream().map(log -> new Record<Object>(log)).collect(Collectors.toList());
+        final Optional<PendingRequestAcknowledgement> pendingAcknowledgement = byteBuffer
+                ? Optional.empty()
+                : requestAcknowledgementHandler.map(handler -> handler.create(ServiceRequestContext.current(), records));
+        final CompletableFuture<Void> acknowledged;
         try {
-            if (buffer.isByteBuffer()) {
+            if (byteBuffer) {
                 buffer.writeBytes(request.toByteArray(), null, bufferWriteTimeoutInMillis);
             } else {
-                final List<Record<Object>> records = logs.stream().map(log -> new Record<Object>(log)).collect(Collectors.toList());
                 buffer.writeAll(records, bufferWriteTimeoutInMillis);
             }
+            acknowledged = pendingAcknowledgement.map(PendingRequestAcknowledgement::complete).orElse(null);
         } catch (Exception e) {
             if (ServiceRequestContext.current().isTimedOut()) {
                 LOG.warn("Exception writing to buffer but request already timed out.", e);
-                return;
+                return COMPLETED;
             }
 
             LOG.error("Failed to write the request of size {} bytes due to:", request.getSerializedSize(), e);
@@ -112,9 +142,19 @@ public class ArmeriaHttpService {
 
         if (ServiceRequestContext.current().isTimedOut()) {
             LOG.warn("Buffer write completed successfully but request already timed out.");
-            return;
+            return COMPLETED;
+        }
+
+        if (acknowledged != null) {
+            final ServiceRequestContext requestContext = ServiceRequestContext.current();
+            return acknowledged.thenRun(() -> {
+                if (!requestContext.isTimedOut()) {
+                    successRequestsCounter.increment();
+                }
+            });
         }
 
         successRequestsCounter.increment();
+        return COMPLETED;
     }
 }

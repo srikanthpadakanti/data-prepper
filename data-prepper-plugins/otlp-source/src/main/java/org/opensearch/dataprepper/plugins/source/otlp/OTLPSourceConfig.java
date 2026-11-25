@@ -6,6 +6,7 @@
 package org.opensearch.dataprepper.plugins.source.otlp;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonPropertyDescription;
 import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.Size;
 import org.apache.commons.lang3.StringUtils;
@@ -44,6 +45,7 @@ public class OTLPSourceConfig {
   static final String ENABLE_UNFRAMED_REQUESTS = "unframed_requests";
   static final String COMPRESSION = "compression";
   static final String RETRY_INFO = "retry_info";
+  static final String ACKNOWLEDGMENTS = "acknowledgments";
   static final int DEFAULT_REQUEST_TIMEOUT = 10; // in seconds
   static final int DEFAULT_PORT = 21893;
   static final int DEFAULT_THREAD_COUNT = 200;
@@ -146,6 +148,10 @@ public class OTLPSourceConfig {
 
   @JsonProperty(RETRY_INFO)
   private RetryInfoConfig retryInfo;
+
+  @JsonProperty(ACKNOWLEDGMENTS)
+  @JsonPropertyDescription("When true, the source responds to a request only after the sinks acknowledge every event in it. Default is false.")
+  private boolean acknowledgments = false;
 
   @JsonProperty("max_connection_age")
   @DurationMin(seconds = 1)
@@ -330,6 +336,10 @@ public class OTLPSourceConfig {
 
   public RetryInfoConfig getRetryInfo() {
     return retryInfo;
+  }
+
+  public boolean isAcknowledgmentsEnabled() {
+    return acknowledgments;
   }
 
   public Duration getMaxConnectionAge() {

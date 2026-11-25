@@ -6,6 +6,7 @@
 package org.opensearch.dataprepper.plugins.source.otelmetrics;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonPropertyDescription;
 import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.Size;
 import org.apache.commons.lang3.StringUtils;
@@ -41,6 +42,7 @@ public class OTelMetricsSourceConfig {
     static final String ENABLE_UNFRAMED_REQUESTS = "unframed_requests";
     static final String COMPRESSION = "compression";
     static final String RETRY_INFO = "retry_info";
+    static final String ACKNOWLEDGMENTS = "acknowledgments";
     static final int DEFAULT_REQUEST_TIMEOUT_MS = 10000;
     static final int DEFAULT_PORT = 21891;
     static final int DEFAULT_THREAD_COUNT = 200;
@@ -128,6 +130,10 @@ public class OTelMetricsSourceConfig {
 
     @JsonProperty(RETRY_INFO)
     private RetryInfoConfig retryInfo;
+
+    @JsonProperty(ACKNOWLEDGMENTS)
+    @JsonPropertyDescription("When true, the source responds to a request only after the sinks acknowledge every event in it. Default is false.")
+    private boolean acknowledgments = false;
 
     @JsonProperty("max_connection_age")
     @DurationMin(seconds = 1)
@@ -282,6 +288,10 @@ public class OTelMetricsSourceConfig {
 
     public RetryInfoConfig getRetryInfo() {
         return retryInfo;
+    }
+
+    public boolean isAcknowledgmentsEnabled() {
+        return acknowledgments;
     }
 
     public void setRetryInfo(RetryInfoConfig retryInfo) {

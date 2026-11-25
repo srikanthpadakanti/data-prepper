@@ -12,6 +12,8 @@ package org.opensearch.dataprepper.model.sink;
 import org.opensearch.dataprepper.model.record.Record;
 import org.opensearch.dataprepper.model.pipeline.HeadlessPipeline;
 import org.junit.jupiter.api.Test;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.equalTo;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.doCallRealMethod;
 
@@ -50,6 +52,12 @@ public class SinkTest {
     public void testSinkUpdateLatencyMetrics() {
         sink = new SinkTestClass();
         sink.updateLatencyMetrics(Collections.emptyList());
+    }
+
+    @Test
+    void handlesFailedEvents_by_default_returns_false() {
+        sink = new SinkTestClass();
+        assertThat(sink.handlesFailedEvents(), equalTo(false));
     }
 
     @Test

@@ -3,6 +3,8 @@ package org.opensearch.dataprepper.plugins.source.oteltrace.http;
 import com.google.protobuf.ByteString;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.notNullValue;
 import org.mockito.MockedStatic;
 import static org.mockito.Mockito.mockStatic;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -12,13 +14,18 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.lenient;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CompletionException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -31,7 +38,10 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.Arguments;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.opensearch.dataprepper.armeria.acknowledgements.PendingRequestAcknowledgement;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.exceptions.BadRequestException;
+import org.opensearch.dataprepper.exceptions.NegativeAcknowledgementException;
 import org.opensearch.dataprepper.exceptions.BufferWriteException;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.buffer.Buffer;
@@ -120,7 +130,7 @@ class ArmeriaHttpServiceTest {
             mocked.when(ServiceRequestContext::current).thenReturn(staticServiceRequestContext);
             armeriaHttpService = new ArmeriaHttpService(buffer, otelProtoDecoder, pluginMetrics, 5000);
 
-            ExportTraceServiceResponse response = armeriaHttpService.exportTrace(request);
+            ExportTraceServiceResponse response = armeriaHttpService.exportTrace(request).join();
             assertNotNull(response);
         }
         verify(requestsReceivedCounter).increment();
@@ -129,6 +139,56 @@ class ArmeriaHttpServiceTest {
         assertThat(recordsReceived.size(), equalTo(1));
         Span span = recordsReceived.get(0).getData();
         assertThat(span.get(key, String.class), equalTo(TRACE_SERVICE_NAME));
+    }
+
+    @Test
+    void exportTrace_with_acknowledgements_completes_only_after_acknowledgement() throws Exception {
+        final RequestAcknowledgementHandler requestAcknowledgementHandler = mock(RequestAcknowledgementHandler.class);
+        final PendingRequestAcknowledgement pendingAcknowledgement = mock(PendingRequestAcknowledgement.class);
+        final CompletableFuture<Void> acknowledged = new CompletableFuture<>();
+        when(requestAcknowledgementHandler.create(any(), any())).thenReturn(pendingAcknowledgement);
+        when(pendingAcknowledgement.complete()).thenReturn(acknowledged);
+        when(buffer.isByteBuffer()).thenReturn(false);
+        final CompletableFuture<ExportTraceServiceResponse> response;
+        try (MockedStatic<ServiceRequestContext> mocked = mockStatic(ServiceRequestContext.class)) {
+            mocked.when(ServiceRequestContext::current).thenReturn(staticServiceRequestContext);
+            armeriaHttpService = new ArmeriaHttpService(buffer, new OTelProtoOpensearchCodec.OTelProtoDecoder(), pluginMetrics, 5000,
+                    Optional.of(requestAcknowledgementHandler));
+
+            response = armeriaHttpService.exportTrace(createExportTraceRequest());
+        }
+
+        assertThat(response.isDone(), equalTo(false));
+        verify(successRequestsCounter, never()).increment();
+
+        acknowledged.complete(null);
+
+        assertThat(response.get(10, TimeUnit.SECONDS), notNullValue());
+        verify(successRequestsCounter).increment();
+    }
+
+    @Test
+    void exportTrace_with_negative_acknowledgement_completes_exceptionally() throws Exception {
+        final RequestAcknowledgementHandler requestAcknowledgementHandler = mock(RequestAcknowledgementHandler.class);
+        final PendingRequestAcknowledgement pendingAcknowledgement = mock(PendingRequestAcknowledgement.class);
+        final CompletableFuture<Void> acknowledged = new CompletableFuture<>();
+        when(requestAcknowledgementHandler.create(any(), any())).thenReturn(pendingAcknowledgement);
+        when(pendingAcknowledgement.complete()).thenReturn(acknowledged);
+        when(buffer.isByteBuffer()).thenReturn(false);
+        final CompletableFuture<ExportTraceServiceResponse> response;
+        try (MockedStatic<ServiceRequestContext> mocked = mockStatic(ServiceRequestContext.class)) {
+            mocked.when(ServiceRequestContext::current).thenReturn(staticServiceRequestContext);
+            armeriaHttpService = new ArmeriaHttpService(buffer, new OTelProtoOpensearchCodec.OTelProtoDecoder(), pluginMetrics, 5000,
+                    Optional.of(requestAcknowledgementHandler));
+
+            response = armeriaHttpService.exportTrace(createExportTraceRequest());
+        }
+
+        acknowledged.completeExceptionally(new NegativeAcknowledgementException(UUID.randomUUID().toString()));
+
+        final CompletionException exception = assertThrows(CompletionException.class, response::join);
+        assertThat(exception.getCause(), instanceOf(NegativeAcknowledgementException.class));
+        verify(successRequestsCounter, never()).increment();
     }
 
     private static Stream<Arguments> getOTelFormatTestArguments() {
@@ -148,7 +208,7 @@ class ArmeriaHttpServiceTest {
             ExportTraceServiceRequest request = ExportTraceServiceRequest.getDefaultInstance();
             when(buffer.isByteBuffer()).thenReturn(true);
 
-            ExportTraceServiceResponse response = armeriaHttpService.exportTrace(request);
+            ExportTraceServiceResponse response = armeriaHttpService.exportTrace(request).join();
             assertNotNull(response);
         }
         verify(requestsReceivedCounter).increment();
@@ -211,7 +271,7 @@ class ArmeriaHttpServiceTest {
             ExportTraceServiceRequest request = ExportTraceServiceRequest.getDefaultInstance();
             when(buffer.isByteBuffer()).thenReturn(false);
 
-            ExportTraceServiceResponse response = armeriaHttpService.exportTrace(request);
+            ExportTraceServiceResponse response = armeriaHttpService.exportTrace(request).join();
             assertNotNull(response);
         }
         verify(requestsReceivedCounter).increment();

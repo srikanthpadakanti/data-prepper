@@ -12,6 +12,8 @@ import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceResponse;
 import io.opentelemetry.proto.collector.metrics.v1.MetricsServiceGrpc;
 import org.opensearch.dataprepper.armeria.authentication.GrpcAuthenticationProvider;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
+import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPlugin;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPluginConstructor;
 import org.opensearch.dataprepper.model.buffer.Buffer;
@@ -34,7 +36,9 @@ import org.opensearch.dataprepper.plugins.source.otelmetrics.certificate.Certifi
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.Collections;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 
 @DataPrepperPlugin(name = "otlp_metrics",
@@ -50,25 +54,52 @@ public class OTelMetricsSource implements Source<Record<? extends Metric>> {
     private final PluginMetrics pluginMetrics;
     private final GrpcAuthenticationProvider authenticationProvider;
     private final CertificateProviderFactory certificateProviderFactory;
+    private final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler;
     private Server server;
     private final ByteDecoder byteDecoder;
 
-    @DataPrepperPluginConstructor
     public OTelMetricsSource(final OTelMetricsSourceConfig oTelMetricsSourceConfig, final PluginMetrics pluginMetrics,
                              final PluginFactory pluginFactory, final PipelineDescription pipelineDescription) {
-        this(oTelMetricsSourceConfig, pluginMetrics, pluginFactory, new CertificateProviderFactory(oTelMetricsSourceConfig), pipelineDescription);
+        this(oTelMetricsSourceConfig, pluginMetrics, pluginFactory, pipelineDescription, null);
     }
 
-    // accessible only in the same package for unit test
+    @DataPrepperPluginConstructor
+    public OTelMetricsSource(final OTelMetricsSourceConfig oTelMetricsSourceConfig, final PluginMetrics pluginMetrics,
+                             final PluginFactory pluginFactory, final PipelineDescription pipelineDescription,
+                             final AcknowledgementSetManager acknowledgementSetManager) {
+        this(oTelMetricsSourceConfig, pluginMetrics, pluginFactory, new CertificateProviderFactory(oTelMetricsSourceConfig), pipelineDescription,
+                acknowledgementSetManager);
+    }
+
     OTelMetricsSource(final OTelMetricsSourceConfig oTelMetricsSourceConfig, final PluginMetrics pluginMetrics, final PluginFactory pluginFactory,
                       final CertificateProviderFactory certificateProviderFactory, final PipelineDescription pipelineDescription) {
+        this(oTelMetricsSourceConfig, pluginMetrics, pluginFactory, certificateProviderFactory, pipelineDescription, null);
+    }
+
+    OTelMetricsSource(final OTelMetricsSourceConfig oTelMetricsSourceConfig, final PluginMetrics pluginMetrics, final PluginFactory pluginFactory,
+                      final CertificateProviderFactory certificateProviderFactory, final PipelineDescription pipelineDescription,
+                      final AcknowledgementSetManager acknowledgementSetManager) {
         oTelMetricsSourceConfig.validateAndInitializeCertAndKeyFileInS3();
+        this.requestAcknowledgementHandler = oTelMetricsSourceConfig.isAcknowledgmentsEnabled()
+                ? Optional.of(new RequestAcknowledgementHandler(acknowledgementSetManager,
+                        Duration.ofMillis(oTelMetricsSourceConfig.getRequestTimeoutInMillis()), pluginMetrics))
+                : Optional.empty();
         this.oTelMetricsSourceConfig = oTelMetricsSourceConfig;
         this.pluginMetrics = pluginMetrics;
         this.certificateProviderFactory = certificateProviderFactory;
         this.pipelineName = pipelineDescription.getPipelineName();
         this.authenticationProvider = createAuthenticationProvider(pluginFactory);
         this.byteDecoder = new OTelMetricDecoder(oTelMetricsSourceConfig.getOutputFormat());
+    }
+
+    @Override
+    public boolean areAcknowledgementsEnabled() {
+        return oTelMetricsSourceConfig.isAcknowledgmentsEnabled();
+    }
+
+    @Override
+    public boolean requiresStrictAcknowledgementValidation() {
+        return oTelMetricsSourceConfig.isAcknowledgmentsEnabled();
     }
 
     @Override
@@ -89,7 +120,8 @@ public class OTelMetricsSource implements Source<Record<? extends Metric>> {
                     buffer,
                     oTelMetricsSourceConfig.getBufferPartitionKeys(),
                     pluginMetrics,
-                    null
+                    null,
+                    requestAcknowledgementHandler
             );
 
             ServerConfiguration serverConfiguration = ConvertConfiguration.convertConfiguration(oTelMetricsSourceConfig);
@@ -121,6 +153,10 @@ public class OTelMetricsSource implements Source<Record<? extends Metric>> {
     @Override
     public void stop() {
         if (server != null) {
+            requestAcknowledgementHandler.ifPresent(handler -> {
+                handler.prepareForShutdown();
+                handler.awaitPendingRequests(Duration.ofMillis(oTelMetricsSourceConfig.getRequestTimeoutInMillis()));
+            });
             try {
                 server.stop().get();
             } catch (ExecutionException ex) {

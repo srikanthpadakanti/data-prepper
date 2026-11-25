@@ -21,10 +21,12 @@ import io.grpc.protobuf.services.ProtoReflectionService;
 import io.micrometer.core.instrument.Counter;
 import io.opentelemetry.proto.collector.logs.v1.LogsServiceGrpc;
 import org.opensearch.dataprepper.GrpcRequestExceptionHandler;
+import org.opensearch.dataprepper.armeria.acknowledgements.RequestAcknowledgementHandler;
 import org.opensearch.dataprepper.armeria.authentication.GrpcAuthenticationProvider;
 import org.opensearch.dataprepper.http.LogThrottlingRejectHandler;
 import org.opensearch.dataprepper.http.LogThrottlingStrategy;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
+import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPlugin;
 import org.opensearch.dataprepper.model.annotations.DataPrepperPluginConstructor;
 import org.opensearch.dataprepper.model.buffer.Buffer;
@@ -58,6 +60,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -78,20 +81,39 @@ public class OTelLogsSource implements Source<Record<Object>> {
     private final ByteDecoder byteDecoder;
     private final PluginFactory pluginFactory;
     final Counter requestsTooLargeCounter;
+    private final Optional<RequestAcknowledgementHandler> requestAcknowledgementHandler;
     private Server server;
+
+    public OTelLogsSource(final OTelLogsSourceConfig oTelLogsSourceConfig,
+                          final PluginMetrics pluginMetrics,
+                          final PluginFactory pluginFactory,
+                          final PipelineDescription pipelineDescription) {
+        this(oTelLogsSourceConfig, pluginMetrics, pluginFactory, pipelineDescription, null);
+    }
 
     @DataPrepperPluginConstructor
     public OTelLogsSource(final OTelLogsSourceConfig oTelLogsSourceConfig,
                           final PluginMetrics pluginMetrics,
                           final PluginFactory pluginFactory,
-                          final PipelineDescription pipelineDescription) {
-        this(oTelLogsSourceConfig, pluginMetrics, pluginFactory, new CertificateProviderFactory(oTelLogsSourceConfig), pipelineDescription);
+                          final PipelineDescription pipelineDescription,
+                          final AcknowledgementSetManager acknowledgementSetManager) {
+        this(oTelLogsSourceConfig, pluginMetrics, pluginFactory, new CertificateProviderFactory(oTelLogsSourceConfig), pipelineDescription,
+                acknowledgementSetManager);
     }
 
-    // accessible only in the same package for unit test
     OTelLogsSource(final OTelLogsSourceConfig oTelLogsSourceConfig, final PluginMetrics pluginMetrics, final PluginFactory pluginFactory,
                    final CertificateProviderFactory certificateProviderFactory, final PipelineDescription pipelineDescription) {
+        this(oTelLogsSourceConfig, pluginMetrics, pluginFactory, certificateProviderFactory, pipelineDescription, null);
+    }
+
+    OTelLogsSource(final OTelLogsSourceConfig oTelLogsSourceConfig, final PluginMetrics pluginMetrics, final PluginFactory pluginFactory,
+                   final CertificateProviderFactory certificateProviderFactory, final PipelineDescription pipelineDescription,
+                   final AcknowledgementSetManager acknowledgementSetManager) {
         oTelLogsSourceConfig.validateAndInitializeCertAndKeyFileInS3();
+        this.requestAcknowledgementHandler = oTelLogsSourceConfig.isAcknowledgmentsEnabled()
+                ? Optional.of(new RequestAcknowledgementHandler(acknowledgementSetManager,
+                        Duration.ofMillis(oTelLogsSourceConfig.getRequestTimeoutInMillis()), pluginMetrics))
+                : Optional.empty();
         this.oTelLogsSourceConfig = oTelLogsSourceConfig;
         this.pluginMetrics = pluginMetrics;
         this.certificateProviderFactory = certificateProviderFactory;
@@ -99,6 +121,16 @@ public class OTelLogsSource implements Source<Record<Object>> {
         this.pluginFactory = pluginFactory;
         this.byteDecoder = new OTelLogsDecoder(oTelLogsSourceConfig.getOutputFormat());
         this.requestsTooLargeCounter = pluginMetrics.counter(HttpExceptionHandler.REQUESTS_TOO_LARGE);
+    }
+
+    @Override
+    public boolean areAcknowledgementsEnabled() {
+        return oTelLogsSourceConfig.isAcknowledgmentsEnabled();
+    }
+
+    @Override
+    public boolean requiresStrictAcknowledgementValidation() {
+        return oTelLogsSourceConfig.isAcknowledgmentsEnabled();
     }
 
     @Override
@@ -191,7 +223,8 @@ public class OTelLogsSource implements Source<Record<Object>> {
         final String path = oTelLogsSourceConfig.getHttpPath().replace("${pipelineName}", pipelineName);
         LOG.info("Configuring HTTP service under {} ", path);
 
-        final ArmeriaHttpService armeriaHttpService = new ArmeriaHttpService(buffer, pluginMetrics, 100, createOtelProtoDecoder());
+        final ArmeriaHttpService armeriaHttpService = new ArmeriaHttpService(buffer, pluginMetrics, 100, createOtelProtoDecoder(),
+                requestAcknowledgementHandler);
         final RetryInfoConfig retryInfo = oTelLogsSourceConfig.getRetryInfo() != null ? oTelLogsSourceConfig.getRetryInfo() : new RetryInfoConfig();
         final HttpExceptionHandler httpExceptionHandler = new HttpExceptionHandler(pluginMetrics, retryInfo.getMinDelay(), retryInfo.getMaxDelay());
 
@@ -225,7 +258,8 @@ public class OTelLogsSource implements Source<Record<Object>> {
                 createOtelProtoDecoder(),
                 buffer,
                 pluginMetrics,
-                null
+                null,
+                requestAcknowledgementHandler
         );
 
         final List<ServerInterceptor> interceptors = new ArrayList<>();
@@ -273,6 +307,10 @@ public class OTelLogsSource implements Source<Record<Object>> {
     @Override
     public void stop() {
         if (server != null) {
+            requestAcknowledgementHandler.ifPresent(handler -> {
+                handler.prepareForShutdown();
+                handler.awaitPendingRequests(Duration.ofMillis(oTelLogsSourceConfig.getRequestTimeoutInMillis()));
+            });
             try {
                 server.stop().get();
             } catch (ExecutionException ex) {

@@ -17,6 +17,7 @@ source:
 * port(Optional) => An `int` represents the port OTel logs source is running on. Default is ```21892```.
 * path(Optional) => A `String` which represents the path for sending unframed HTTP requests. This can be used for supporting unframed gRPC with HTTP idiomatic path to a configurable path. It should start with `/` and length should be at least 1. `/opentelemetry.proto.collector.logs.v1.LogsService/Export` endpoint will be disabled for both gRPC and HTTP requests if path is configured. Path can contain `${pipelineName}` placeholder which will be replaced with pipeline name.
 * request_timeout(Optional) => An `int` represents request timeout in millis. Default is ```10_000```.
+* acknowledgments(Optional) => A `boolean` that enables end-to-end acknowledgments. When `true`, the source answers each request only after the sinks acknowledge every event in it. A negative acknowledgment returns gRPC `UNAVAILABLE` or HTTP `429` with `Retry-After`; `request_timeout` is the only deadline, so it must be longer than the sink flush time. On shutdown, new requests get gRPC `UNAVAILABLE` or HTTP `503` while the source waits up to `request_timeout` for pending requests. The pipeline must pass the strict acknowledgment checks at startup: no processor that needs peer forwarding or holds events, no byte buffer, a failure pipeline (`dlq_pipeline`), and every sink uses the failure pipeline or its own DLQ. Default is `false`.
 * health_check_service(Optional) => A boolean enables a gRPC health check service under ```grpc.health.v1 / Health / Check```. Default is ```false```.
 * proto_reflection_service(Optional) => A boolean enables a reflection service for Protobuf services (see [ProtoReflectionService](https://grpc.github.io/grpc-java/javadoc/io/grpc/protobuf/services/ProtoReflectionService.html) and [gRPC reflection](https://github.com/grpc/grpc-java/blob/master/documentation/server-reflection-tutorial.md) docs). Default is ```false```.
 * unframed_requests(Optional) => A boolean to enable requests not framed using the gRPC wire protocol. 
@@ -31,6 +32,8 @@ source:
 ### Retry Information
 
 Data Prepper replies with a `RetryInfo` specifying how long to wait for the next request in case backpressure builds up. The retry information is implemented as exponential backoff, with a max delay of `retry_info.max_delay`.
+
+Over HTTP, request and buffer-write timeouts are answered with `429 Too Many Requests` and a `Retry-After` header that carries the same delay in whole seconds, rounded up. A request that is larger than `max_request_length` or the buffer capacity is answered with `413 Payload Too Large`, because retrying it cannot succeed.
 
 ```yaml
 source:

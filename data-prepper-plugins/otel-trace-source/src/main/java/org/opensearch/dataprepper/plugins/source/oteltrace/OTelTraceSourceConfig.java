@@ -15,6 +15,7 @@ import org.opensearch.dataprepper.model.configuration.PluginModel;
 import org.opensearch.dataprepper.plugins.otel.codec.OTelOutputFormat;
 import org.opensearch.dataprepper.plugins.server.RetryInfoConfig;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonPropertyDescription;
 import org.apache.commons.lang3.StringUtils;
 
 import java.time.Duration;
@@ -39,6 +40,7 @@ public class OTelTraceSourceConfig {
     static final String UNAUTHENTICATED_HEALTH_CHECK = "unauthenticated_health_check";
     static final String COMPRESSION = "compression";
     static final String RETRY_INFO = "retry_info";
+    static final String ACKNOWLEDGMENTS = "acknowledgments";
     static final int DEFAULT_REQUEST_TIMEOUT_MS = 10000;
     static final int DEFAULT_PORT = 21890;
     static final int DEFAULT_THREAD_COUNT = 200;
@@ -119,6 +121,10 @@ public class OTelTraceSourceConfig {
 
     @JsonProperty(RETRY_INFO)
     private RetryInfoConfig retryInfo;
+
+    @JsonProperty(ACKNOWLEDGMENTS)
+    @JsonPropertyDescription("When true, the source responds to a request only after the sinks acknowledge every event in it. Default is false.")
+    private boolean acknowledgments = false;
 
     @JsonProperty("max_connection_age")
     @DurationMin(seconds = 1)
@@ -258,6 +264,10 @@ public class OTelTraceSourceConfig {
 
     public RetryInfoConfig getRetryInfo() {
         return retryInfo;
+    }
+
+    public boolean isAcknowledgmentsEnabled() {
+        return acknowledgments;
     }
 
     public Duration getMaxConnectionAge() {

@@ -218,6 +218,11 @@ public class OpenSearchSink extends AbstractSink<Record<Event>> {
   }
 
   @Override
+  public boolean handlesFailedEvents() {
+    return openSearchSinkConfiguration.getPullIndexing() == null;
+  }
+
+  @Override
   public void doOutput(final Collection<Record<Event>> records) {
     ingester.output(records);
   }
