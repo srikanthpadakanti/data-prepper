@@ -70,6 +70,7 @@ import java.util.TreeMap;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import static org.opensearch.dataprepper.plugins.processor.otel_apm_service_map.model.internal.SpanStateData.isPublishableDependencyName;
@@ -88,6 +89,7 @@ public class OTelApmServiceMapProcessor extends AbstractProcessor<Record<Event>,
     static final String WINDOW_EVALUATION_TRACES_METRIC = "windowEvaluationTraces";
     static final String WINDOW_EVALUATION_SPANS_METRIC = "windowEvaluationSpans";
 
+    private static final int LIVE_WINDOWS = 3;
     private static final Logger LOG = LoggerFactory.getLogger(OTelApmServiceMapProcessor.class);
     private static final String EVENT_TYPE_OTEL_APM_SERVICE_MAP = "SERVICE_MAP";
     private static final Collection<Record<Event>> EMPTY_COLLECTION = Collections.emptySet();
@@ -115,6 +117,7 @@ public class OTelApmServiceMapProcessor extends AbstractProcessor<Record<Event>,
     private static volatile MapDbProcessorState<Collection<SpanStateData>> previousWindow;
     private static volatile MapDbProcessorState<Collection<SpanStateData>> currentWindow;
     private static volatile MapDbProcessorState<Collection<SpanStateData>> nextWindow;
+    private static volatile WindowAcknowledgements windowAcknowledgements;
     private static File dbPath;
     private static Clock clock;
 
@@ -245,6 +248,7 @@ public class OTelApmServiceMapProcessor extends AbstractProcessor<Record<Event>,
             currentWindow = new MapDbProcessorState<>(dbPath, getNewDbName(), processWorkers);
             previousWindow = new MapDbProcessorState<>(dbPath, getNewDbName() + "-previous", processWorkers);
             nextWindow = new MapDbProcessorState<>(dbPath, getNewDbName() + "-next", processWorkers);
+            windowAcknowledgements = new WindowAcknowledgements(LIVE_WINDOWS);
 
             allThreadsCyclicBarrier = new CyclicBarrier(processWorkers);
         }
@@ -275,7 +279,11 @@ public class OTelApmServiceMapProcessor extends AbstractProcessor<Record<Event>,
         final Collection<Record<Event>> apmEvents = windowDurationHasPassed() ? evaluateApmEvents() : EMPTY_COLLECTION;
         final Map<byte[], Collection<SpanStateData>> batchStateData = new TreeMap<>(SignedBytes.lexicographicalComparator());
 
-        records.forEach(i -> processSpan((Span) i.getData(), batchStateData));
+        records.forEach(i -> {
+            if (processSpan((Span) i.getData(), batchStateData)) {
+                windowAcknowledgements.attachToNewestWindow(i.getData());
+            }
+        });
 
         try {
             // Update next window with batch data organized by traceId
@@ -307,11 +315,13 @@ public class OTelApmServiceMapProcessor extends AbstractProcessor<Record<Event>,
 
     @Override
     public void shutdown() {
+        final boolean everySpanEvaluated = currentWindow.size() == 0 && (nextWindow == null || nextWindow.size() == 0);
         previousWindow.delete();
         currentWindow.delete();
         if (nextWindow != null) {
             nextWindow.delete();
         }
+        windowAcknowledgements.releaseAll(everySpanEvaluated);
         processorsCreated.set(0);
         allThreadsCyclicBarrier.reset();
     }
@@ -350,7 +360,7 @@ public class OTelApmServiceMapProcessor extends AbstractProcessor<Record<Event>,
         return path;
     }
 
-    private void processSpan(final Span span, final Map<byte[], Collection<SpanStateData>> batchStateData) {
+    private boolean processSpan(final Span span, final Map<byte[], Collection<SpanStateData>> batchStateData) {
         if (span.getServiceName() != null) {
             final String serviceName = span.getServiceName();
             final String spanId = span.getSpanId();
@@ -384,10 +394,12 @@ public class OTelApmServiceMapProcessor extends AbstractProcessor<Record<Event>,
                 Collection<SpanStateData> spansForTrace = batchStateData.computeIfAbsent(Hex.decodeHex(traceId),
                         k -> new HashSet<>());
                 spansForTrace.add(spanStateData);
+                return true;
             } catch (Exception e) {
                 LOG.error("Caught exception trying to put span state data into batch", e);
             }
         }
+        return false;
     }
 
     /**
@@ -452,24 +464,35 @@ public class OTelApmServiceMapProcessor extends AbstractProcessor<Record<Event>,
      */
     private Collection<Record<Event>> evaluateApmEvents() {
         LOG.debug("Evaluating APM service map events with three-window semantics");
+        final AtomicReference<Collection<Record<Event>>> apmEvents = new AtomicReference<>(Collections.emptySet());
         try {
             allThreadsCyclicBarrier.await();
 
-            Collection<Record<Event>> apmEvents = new HashSet<>();
             if (isMasterInstance()) {
-                apmEvents = windowEvaluationTimer.record(() -> {
-                    final Collection<Record<Event>> windowEvents = processCurrentWindowSpans();
+                windowEvaluationTimer.record(() -> {
+                    apmEvents.set(processCurrentWindowSpans());
+                    windowAcknowledgements.holdUntilReleased(apmEvents.get());
                     rotateWindows();
-                    return windowEvents;
                 });
             }
 
             allThreadsCyclicBarrier.await();
 
-            return apmEvents;
+            return apmEvents.get();
         } catch (InterruptedException | BrokenBarrierException e) {
+            releaseAsFailed(apmEvents.get());
             throw new RuntimeException(e);
+        } catch (final RuntimeException e) {
+            releaseAsFailed(apmEvents.get());
+            throw e;
         }
+    }
+
+    private static void releaseAsFailed(final Collection<Record<Event>> records) {
+        records.stream()
+                .map(record -> record.getData().getEventHandle())
+                .filter(Objects::nonNull)
+                .forEach(eventHandle -> eventHandle.release(false));
     }
 
     /**
@@ -630,6 +653,7 @@ public class OTelApmServiceMapProcessor extends AbstractProcessor<Record<Event>,
         currentWindow = nextWindow;
         nextWindow = tempWindow;
         nextWindow.clear();
+        windowAcknowledgements.rotate();
 
         previousTimestamp = clock.instant();
         LOG.debug("Done rotating APM service map windows - All metrics cleared for new window");

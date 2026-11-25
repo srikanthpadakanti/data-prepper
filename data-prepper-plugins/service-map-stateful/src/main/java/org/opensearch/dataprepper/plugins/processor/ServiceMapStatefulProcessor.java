@@ -58,6 +58,7 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final Collection<Record<Event>> EMPTY_COLLECTION = Collections.emptySet();
     private static final Integer TO_MILLIS = 1_000;
+    private static final int LIVE_WINDOWS = 2;
 
     // TODO: This should not be tracked in this class, move it up to the creator
     private static final AtomicInteger processorsCreated = new AtomicInteger(0);
@@ -71,6 +72,7 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
     private static volatile MapDbProcessorState<String> currentTraceGroupWindow;
     private static volatile Set<ServiceNodeData> previousIsolatedServiceNodes;
     private static volatile Set<ServiceNodeData> currentIsolatedServiceNodes;
+    private static volatile WindowAcknowledgements windowAcknowledgements;
     //TODO: Consider keeping this state in a db
     private static final Set<ServiceMapRelationship> RELATIONSHIP_STATE = Sets.newConcurrentHashSet();
     private static File dbPath;
@@ -111,6 +113,7 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
             previousTraceGroupWindow = new MapDbProcessorState<>(dbPath, getNewTraceDbName() + EMPTY_SUFFIX, processWorkers);
             currentIsolatedServiceNodes = Sets.newConcurrentHashSet();
             previousIsolatedServiceNodes = Sets.newConcurrentHashSet();
+            windowAcknowledgements = new WindowAcknowledgements(LIVE_WINDOWS);
 
             allThreadsCyclicBarrier = new CyclicBarrier(processWorkers);
         }
@@ -149,7 +152,11 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
     public Collection<Record<Event>> doExecute(Collection<Record<Event>> records) {
         final Collection<Record<Event>> relationships = windowDurationHasPassed() ? evaluateEdges() : EMPTY_COLLECTION;
         final Map<byte[], ServiceMapStateData> batchStateData = new TreeMap<>(SignedBytes.lexicographicalComparator());
-        records.forEach(i -> processSpan((Span) i.getData(), batchStateData));
+        records.forEach(i -> {
+            if (processSpan((Span) i.getData(), batchStateData)) {
+                windowAcknowledgements.attachToNewestWindow(i.getData());
+            }
+        });
         try {
             currentWindow.putAll(batchStateData);
         } catch (RuntimeException e) {
@@ -158,7 +165,7 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
         return relationships;
     }
 
-    private void processSpan(final Span span, final Map<byte[], ServiceMapStateData> batchStateData) {
+    private boolean processSpan(final Span span, final Map<byte[], ServiceMapStateData> batchStateData) {
         if (span.getServiceName() != null) {
             final String serviceName = span.getServiceName();
             final String spanId = span.getSpanId();
@@ -170,7 +177,7 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
                 traceId = Hex.decodeHex(span.getTraceId());
             } catch (DecoderException e) {
                 LOG.error("Caught DecoderException when decoding the traceId.", e);
-                return;
+                return false;
             }
             currentIsolatedServiceNodes.add(new ServiceNodeData(traceId, serviceName));
             try {
@@ -192,7 +199,9 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
                     LOG.error("Caught exception trying to put trace group name", e);
                 }
             }
+            return true;
         }
+        return false;
     }
 
     /**
@@ -202,18 +211,22 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
      */
     private Collection<Record<Event>> evaluateEdges() {
         LOG.debug("Evaluating service map edges");
+        final Collection<Record<Event>> serviceDependencyRecords = new HashSet<>();
         try {
-            final Collection<Record<Event>> serviceDependencyRecords = new HashSet<>();
 
             serviceDependencyRecords.addAll(iterateProcessorState(previousWindow));
             serviceDependencyRecords.addAll(iterateProcessorState(currentWindow));
             LOG.debug("Done evaluating service map edges");
+            if (!isMasterInstance()) {
+                windowAcknowledgements.holdUntilReleased(serviceDependencyRecords);
+            }
 
             // Wait for all workers before rotating windows
             allThreadsCyclicBarrier.await();
 
             if (isMasterInstance()) {
                 processIsolatedServiceMapNodes(serviceDependencyRecords);
+                windowAcknowledgements.holdUntilReleased(serviceDependencyRecords);
                 rotateWindows();
             }
 
@@ -222,8 +235,19 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
 
             return serviceDependencyRecords;
         } catch (InterruptedException | BrokenBarrierException e) {
+            releaseAsFailed(serviceDependencyRecords);
             throw new RuntimeException(e);
+        } catch (final RuntimeException e) {
+            releaseAsFailed(serviceDependencyRecords);
+            throw e;
         }
+    }
+
+    private static void releaseAsFailed(final Collection<Record<Event>> records) {
+        records.stream()
+                .map(record -> record.getData().getEventHandle())
+                .filter(Objects::nonNull)
+                .forEach(eventHandle -> eventHandle.release(false));
     }
 
     private Collection<Record<Event>> iterateProcessorState(final MapDbProcessorState<ServiceMapStateData> processorState) {
@@ -276,6 +300,11 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
                         .withEventType(EVENT_TYPE)
                         .withData(serviceMapRelationship)
                         .build();
+                destinationRelationshipEvent.getEventHandle().onRelease((eventHandle, result) -> {
+                    if (!result) {
+                        RELATIONSHIP_STATE.remove(serviceMapRelationship);
+                    }
+                });
                 serviceDependencyRecords.add(new Record<>(destinationRelationshipEvent));
                 RELATIONSHIP_STATE.add(serviceMapRelationship);
             } catch (Exception e) {
@@ -313,12 +342,14 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
 
     @Override
     public void shutdown() {
+        final boolean everySpanEvaluated = currentWindow.size() == 0;
         previousWindow.delete();
         currentWindow.delete();
         previousTraceGroupWindow.delete();
         currentTraceGroupWindow.delete();
         previousIsolatedServiceNodes.clear();
         currentIsolatedServiceNodes.clear();
+        windowAcknowledgements.releaseAll(everySpanEvaluated);
     }
 
     private void processIsolatedServiceMapNodes(final Collection<Record<Event>> serviceDependencyRecords) {
@@ -355,6 +386,8 @@ public class ServiceMapStatefulProcessor extends AbstractProcessor<Record<Event>
         previousIsolatedServiceNodes = currentIsolatedServiceNodes;
         currentIsolatedServiceNodes = tempNodesWindow;
         currentIsolatedServiceNodes.clear();
+
+        windowAcknowledgements.rotate();
 
         previousTimestamp = clock.millis();
         LOG.debug("Done rotating service map windows");

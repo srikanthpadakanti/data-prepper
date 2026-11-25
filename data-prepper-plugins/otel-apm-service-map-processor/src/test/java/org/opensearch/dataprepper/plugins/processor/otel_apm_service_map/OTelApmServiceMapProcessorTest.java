@@ -19,7 +19,9 @@ import org.junit.jupiter.api.io.TempDir;
 import org.mockito.Mock;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.configuration.PipelineDescription;
+import org.opensearch.dataprepper.model.event.DefaultEventHandle;
 import org.opensearch.dataprepper.model.event.Event;
+import org.opensearch.dataprepper.model.event.EventHandle;
 import org.opensearch.dataprepper.model.event.JacksonEvent;
 import org.opensearch.dataprepper.model.metric.JacksonSum;
 import org.opensearch.dataprepper.model.event.EventMetadata;
@@ -55,6 +57,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.not;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -2422,6 +2426,131 @@ class OTelApmServiceMapProcessorTest extends BaseDataPrepperPluginStandardTestSu
         return new DependencyNodesConfig(true, DependencyNodesConfig.DEFAULT_MAX_DEPENDENCIES_PER_SERVICE,
                 DependencyNodesConfig.DEFAULT_MAX_REMOTE_OPERATIONS_PER_SERVICE,
                 DependencyNamingPolicy.DEFAULT_HOSTNAME_DENYLIST_PATTERNS);
+    }
+
+    @Test
+    void doExecute_releases_spans_only_after_their_window_retires_and_emitted_events_are_released() {
+        final OTelApmServiceMapProcessor proc = newFlushingProcessor("acks-");
+        try {
+            final CountingAcknowledgementSet acknowledgementSet = new CountingAcknowledgementSet();
+            final List<Record<Event>> spans = clientAndServerSpansIn(acknowledgementSet);
+
+            final Collection<Record<Event>> emitted = flushAll(proc, spans);
+            spans.forEach(span -> span.getData().getEventHandle().release(true));
+
+            assertThat(emitted, not(empty()));
+            assertThat(acknowledgementSet.isDone(), equalTo(false));
+
+            emitted.forEach(record -> record.getData().getEventHandle().release(true));
+
+            assertThat(acknowledgementSet.isDone(), equalTo(false));
+
+            when(clock.instant()).thenReturn(testTime.plusSeconds(195));
+            proc.doExecute(Collections.emptyList());
+
+            assertThat(acknowledgementSet.isDone(), equalTo(true));
+            assertThat(acknowledgementSet.getResult(), equalTo(true));
+        } finally {
+            proc.shutdown();
+        }
+    }
+
+    @Test
+    void doExecute_retired_window_still_waits_for_unreleased_emitted_events() {
+        final OTelApmServiceMapProcessor proc = newFlushingProcessor("acks-negative-");
+        try {
+            final CountingAcknowledgementSet acknowledgementSet = new CountingAcknowledgementSet();
+            final List<Record<Event>> spans = clientAndServerSpansIn(acknowledgementSet);
+
+            final Collection<Record<Event>> emitted = flushAll(proc, spans);
+            spans.forEach(span -> span.getData().getEventHandle().release(true));
+            when(clock.instant()).thenReturn(testTime.plusSeconds(195));
+            proc.doExecute(Collections.emptyList());
+
+            assertThat(acknowledgementSet.isDone(), equalTo(false));
+
+            final List<Record<Event>> emittedRecords = new ArrayList<>(emitted);
+            emittedRecords.subList(1, emittedRecords.size()).forEach(record -> record.getData().getEventHandle().release(true));
+
+            assertThat(emittedRecords.size() > 1, equalTo(true));
+            assertThat(acknowledgementSet.isDone(), equalTo(false));
+
+            emittedRecords.get(0).getData().getEventHandle().release(false);
+
+            assertThat(acknowledgementSet.isDone(), equalTo(true));
+            assertThat(acknowledgementSet.getResult(), equalTo(false));
+        } finally {
+            proc.shutdown();
+        }
+    }
+
+    @Test
+    void shutdown_after_every_span_is_evaluated_releases_the_windows_positively() {
+        final OTelApmServiceMapProcessor proc = newFlushingProcessor("acks-shutdown-");
+        final CountingAcknowledgementSet acknowledgementSet = new CountingAcknowledgementSet();
+        try {
+            final List<Record<Event>> spans = clientAndServerSpansIn(acknowledgementSet);
+            final Collection<Record<Event>> emitted = flushAll(proc, spans);
+            spans.forEach(span -> span.getData().getEventHandle().release(true));
+            emitted.forEach(record -> record.getData().getEventHandle().release(true));
+
+            assertThat(acknowledgementSet.isDone(), equalTo(false));
+        } finally {
+            proc.shutdown();
+        }
+
+        assertThat(acknowledgementSet.isDone(), equalTo(true));
+        assertThat(acknowledgementSet.getResult(), equalTo(true));
+    }
+
+    @Test
+    void shutdown_with_unevaluated_spans_releases_the_windows_negatively() {
+        final OTelApmServiceMapProcessor proc = newFlushingProcessor("acks-shutdown-early-");
+        final CountingAcknowledgementSet acknowledgementSet = new CountingAcknowledgementSet();
+        try {
+            final List<Record<Event>> spans = clientAndServerSpansIn(acknowledgementSet);
+            proc.doExecute(spans);
+            spans.forEach(span -> span.getData().getEventHandle().release(true));
+
+            assertThat(acknowledgementSet.isDone(), equalTo(false));
+        } finally {
+            proc.shutdown();
+        }
+
+        assertThat(acknowledgementSet.isDone(), equalTo(true));
+        assertThat(acknowledgementSet.getResult(), equalTo(false));
+    }
+
+    @Test
+    void doExecute_span_without_service_name_is_not_held() {
+        final OTelApmServiceMapProcessor proc = newFlushingProcessor("acks-no-service-");
+        try {
+            final CountingAcknowledgementSet acknowledgementSet = new CountingAcknowledgementSet();
+            final Span span = withEventHandleIn(acknowledgementSet, createMockSpanWithIds(null, "call",
+                    "SPAN_KIND_CLIENT", "1111111111111111", "", "aaaaaaaaaaaaaaaa"));
+
+            proc.doExecute(Collections.singletonList(new Record<>(span)));
+            span.getEventHandle().release(true);
+
+            assertThat(acknowledgementSet.isDone(), equalTo(true));
+        } finally {
+            proc.shutdown();
+        }
+    }
+
+    private List<Record<Event>> clientAndServerSpansIn(final CountingAcknowledgementSet acknowledgementSet) {
+        final Span client = withEventHandleIn(acknowledgementSet, createMockSpanWithIds("frontend", "call",
+                "SPAN_KIND_CLIENT", "1111111111111111", "", "aaaaaaaaaaaaaaaa"));
+        final Span server = withEventHandleIn(acknowledgementSet, createMockSpanWithIds("cart", "get_items",
+                "SPAN_KIND_SERVER", "2222222222222222", "1111111111111111", "aaaaaaaaaaaaaaaa"));
+        return Arrays.asList(new Record<>(client), new Record<>(server));
+    }
+
+    private static Span withEventHandleIn(final CountingAcknowledgementSet acknowledgementSet, final Span span) {
+        final EventHandle eventHandle = new DefaultEventHandle(Instant.now());
+        acknowledgementSet.add(eventHandle);
+        lenient().when(span.getEventHandle()).thenReturn(eventHandle);
+        return span;
     }
 
     // Builds a processor whose emitted events are real JacksonEvents (so NodeOperationDetail fields
